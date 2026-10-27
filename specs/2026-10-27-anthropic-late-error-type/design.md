@@ -2,7 +2,7 @@
 
 ## 目标
 
-在不改变窗口、心跳与透传语义的前提下，让网关先回 200 之后的 Anthropic 5xx/连接失败可以用指定的 `error.type` 写出，使 Claude Code 继续走流式重试。
+在不改变窗口、心跳与透传语义的前提下，让网关先回 200 之后的 Anthropic 5xx/请求失败可以用指定的 `error.type` 写出，使 Claude Code 继续走流式重试。
 
 ## 配置（`src/config.rs`）
 
@@ -23,7 +23,7 @@ pub fn build_late(
 ) -> Bytes
 ```
 
-- 改写条件：`anthropic_type` 为 `Some`，`kind` 为 `AnthropicMessages`，`status` 为 `None`（连接失败）或 5xx。
+- 改写条件：`anthropic_type` 为 `Some`，`kind` 为 `AnthropicMessages`，`status` 为 `None`（请求失败，如连上后未回响应头就断开）或 5xx。
 - 改写方式：私有的 `build_anthropic` 增加 `etype_override` 参数（`build` 传 `None`）。
   - 上游体能被 `parse_anthropic_error` 解析且 `error` 为对象：就地把 `error.type` 设为该值，其余字段原样保留，紧凑序列化为单行 `data:`。
   - 解析不了，或 `error` 不是对象：按现有模板合成，`type` 取该值，`message` 仍由 `message(body, reason, status)` 生成。
