@@ -1254,3 +1254,52 @@ async fn test_sse_slow_path_identity() {
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
 }
+
+#[tokio::test]
+async fn test_delayed_200_sent_at_window() {
+    // 窗口超时网关发 200 时，响应头与首个心跳应立即发出，而不是再等一个间隔
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            3000, // 响应头延迟 3s，超过两个 1s 间隔
+            vec![(b"data: hello\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut stream = tokio::net::TcpStream::connect(gw).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    // 1s 窗口到期即应收到；第二个间隔（2s）才有字节就说明首个心跳没有立即写出。
+    let head = tokio::time::timeout(Duration::from_millis(1600), async {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !got.windows(3).any(|w| w == b":\n\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    })
+    .await
+    .expect("1.6s 内应收到网关的 200 响应头与首个心跳");
+    let head = String::from_utf8_lossy(&head).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    assert!(String::from_utf8_lossy(&rest).contains("hello"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
