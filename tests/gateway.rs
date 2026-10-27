@@ -139,6 +139,7 @@ fn test_cfg(upstream: SocketAddr, heartbeat: u64, max_probe_body: usize) -> Reso
         connect_timeout: Duration::from_secs(5),
         max_probe_body,
         shutdown_timeout: Duration::from_secs(30),
+        anthropic_late_error_type: None,
     }
 }
 
@@ -1252,5 +1253,75 @@ async fn test_sse_slow_path_identity() {
     );
 
     tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+/// 慢路径测试用配置：1s 心跳，迟到错误改写为 `overloaded_error`。
+fn late_overloaded_cfg(upstream: SocketAddr) -> ResolvedConfig {
+    ResolvedConfig {
+        anthropic_late_error_type: Some("overloaded_error".to_string()),
+        ..test_cfg(upstream, 1, 32 * 1024 * 1024)
+    }
+}
+
+/// 对 Anthropic Messages 发流式请求，返回 (status, 去分块后的 body)。
+async fn post_anthropic_stream(gw: SocketAddr) -> (u16, String) {
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, _, resp_body) = parse_response(&resp);
+    (
+        status,
+        String::from_utf8_lossy(&dechunk(&resp_body)).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn test_late_502_anthropic_overloaded() {
+    // 慢上游 502（sub2api 格式错误体）→ 网关先发 200，错误事件 type 改写为 overloaded_error
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        let body = br#"{"type":"error","error":{"type":"upstream_error","message":"Upstream request failed"}}"#;
+        (
+            502,
+            vec![("content-type", "application/json".to_string())],
+            1500, // 1.5s header delay > 1s window
+            vec![(body.to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(late_overloaded_cfg(upstream)).await;
+
+    let (status, s) = post_anthropic_stream(gw).await;
+    assert_eq!(status, 200);
+    assert!(s.contains("\"type\":\"overloaded_error\""), "{s}");
+    assert!(s.contains("Upstream request failed"), "{s}");
+    assert!(!s.contains("upstream_error"), "{s}");
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_late_connect_failure_anthropic_overloaded() {
+    // 上游收下请求后 1.5s 不回任何字节即关闭 → bridge 的连接失败分支，type 改写为 overloaded_error
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    tokio::task::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        sleep(Duration::from_millis(1500)).await;
+    });
+    let (gw, gw_tx) = start_gateway_with(late_overloaded_cfg(upstream)).await;
+
+    let (status, s) = post_anthropic_stream(gw).await;
+    assert_eq!(status, 200);
+    assert!(s.contains("\"type\":\"overloaded_error\""), "{s}");
+    assert!(s.contains("upstream request failed"), "{s}");
+
     gw_tx.send(()).unwrap();
 }
