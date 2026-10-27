@@ -1288,7 +1288,7 @@ async fn test_late_502_anthropic_overloaded() {
         (
             502,
             vec![("content-type", "application/json".to_string())],
-            1500, // 1.5s header delay > 1s window
+            1500, // 响应头延迟 1.5s，超过 1s 窗口
             vec![(body.to_vec(), 0)],
         )
     })
@@ -1323,5 +1323,85 @@ async fn test_late_connect_failure_anthropic_overloaded() {
     assert!(s.contains("\"type\":\"overloaded_error\""), "{s}");
     assert!(s.contains("upstream request failed"), "{s}");
 
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_late_429_anthropic_not_rewritten() {
+    // 慢上游 429 + 开关 → 4xx 不改写，错误事件保留上游的 rate_limit_error
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        let body = br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        (
+            429,
+            vec![("content-type", "application/json".to_string())],
+            1500, // 响应头延迟 1.5s，超过 1s 窗口
+            vec![(body.to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(late_overloaded_cfg(upstream)).await;
+
+    let (status, s) = post_anthropic_stream(gw).await;
+    assert_eq!(status, 200);
+    assert!(s.contains("\"type\":\"rate_limit_error\""), "{s}");
+    assert!(!s.contains("overloaded_error"), "{s}");
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_late_stream_error_not_rewritten() {
+    // 慢上游回 2xx SSE，发出一个事件后中途断开 → 内容可能已转发，不改写，仍为 api_error
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    tokio::task::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        sleep(Duration::from_millis(1500)).await;
+        let event = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let mut resp = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();
+        resp.extend_from_slice(format!("{:x}\r\n", event.len()).as_bytes());
+        resp.extend_from_slice(event);
+        resp.extend_from_slice(b"\r\n");
+        stream.write_all(&resp).await.unwrap();
+        stream.flush().await.unwrap();
+        // 不发结尾的 0 块，直接关闭连接。
+    });
+    let (gw, gw_tx) = start_gateway_with(late_overloaded_cfg(upstream)).await;
+
+    let (status, s) = post_anthropic_stream(gw).await;
+    assert_eq!(status, 200);
+    assert!(s.contains("\"type\":\"ping\""), "{s}");
+    assert!(s.contains("\"type\":\"api_error\""), "{s}");
+    assert!(!s.contains("overloaded_error"), "{s}");
+
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_late_undecodable_encoding_not_rewritten() {
+    // 慢上游回 2xx SSE 但 Content-Encoding 不可解码 → 不改写，仍为 api_error
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![
+                ("content-type", "text/event-stream".to_string()),
+                ("content-encoding", "compress".to_string()),
+            ],
+            1500, // 响应头延迟 1.5s，超过 1s 窗口
+            vec![(b"data: hello\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(late_overloaded_cfg(upstream)).await;
+
+    let (status, s) = post_anthropic_stream(gw).await;
+    assert_eq!(status, 200);
+    assert!(s.contains("\"type\":\"api_error\""), "{s}");
+    assert!(!s.contains("overloaded_error"), "{s}");
+
+    tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
 }

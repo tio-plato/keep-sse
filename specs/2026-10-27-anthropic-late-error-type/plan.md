@@ -12,16 +12,16 @@
 - `build_late` 按改写条件分派到 `build_anthropic(.., Some(t))` 或 `build`。
 - 单元测试：
   - sub2api 风格的 502 错误体：`error.type` 改写，`message` 保留，单行 `data:`；
-  - 连接失败：`type` 改写，`message` 与 `build` 相同；
+  - 请求失败（`status` 为 `None`）：`type` 改写，`message` 与 `build` 相同；
   - 非 JSON 的 503：`type` 改写，`message` 为原文；
   - `error` 不是对象：按模板合成，`type` 改写；
   - 400/401/429：与 `build` 逐字节相同；
-  - 其他三种接口（502 与连接失败）：与 `build` 逐字节相同；
+  - 其他三种接口（502 与请求失败）：与 `build` 逐字节相同；
   - 开关为 `None`：与 `build` 逐字节相同。
 
 ## 3. `src/sse.rs` — 调用点
 
-- `handle_stream` 传开关给 `bridge`；`bridge` 的连接失败分支改用 `build_late`。
+- `handle_stream` 传开关给 `bridge`；`bridge` 的请求失败分支（`Err`）改用 `build_late`。
 - `handle_error` 改为 `read_error_body`，返回错误体；`bridge` 用 `build_late` 构造事件。
 - `handle_success` 不改。
 

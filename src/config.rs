@@ -32,7 +32,7 @@ pub struct Config {
     #[arg(long, env = "KEEP_SSE_SHUTDOWN_TIMEOUT", default_value_t = 30)]
     pub shutdown_timeout: u64,
 
-    /// 网关已先回 200 之后，上游 5xx 或连接失败时，Anthropic 错误事件改写成的 `error.type`；
+    /// 网关已先回 200 之后，上游 5xx 或请求失败时，Anthropic 错误事件改写成的 `error.type`；
     /// 不设则按现有映射。
     #[arg(long, env = "KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE")]
     pub anthropic_late_error_type: Option<String>,

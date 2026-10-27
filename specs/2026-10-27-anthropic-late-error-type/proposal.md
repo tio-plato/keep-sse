@@ -1,6 +1,6 @@
 # Proposal: 迟到的 5xx 可改写 Anthropic 错误类型
 
-新增配置项 `--anthropic-late-error-type` / `KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE`，默认不设。设置后，网关已先回 200（窗口超时）、随后上游返回 5xx 或连接失败时，Anthropic Messages 的 SSE 错误事件 `error.type` 改写为该值，其余字段不变。
+新增配置项 `--anthropic-late-error-type` / `KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE`，默认不设。设置后，网关已先回 200（窗口超时）、随后上游返回 5xx 或请求失败时，Anthropic Messages 的 SSE 错误事件 `error.type` 改写为该值，其余字段不变。
 
 ## 动机
 
@@ -13,7 +13,7 @@ Claude Code 对已收到 200 的流式响应中的错误事件按 `error.type` �
 
 ## 澄清补充（2026-10-27）
 
-- **作用范围**：仅 Anthropic Messages；仅网关已先回 200 之后（`bridge` 路径）；仅上游 5xx 或连接失败。
+- **作用范围**：仅 Anthropic Messages；仅网关已先回 200 之后（`bridge` 路径）；仅上游 5xx 或请求失败（`status` 为空，如连上后未回响应头就断开）。连接超时（默认 10 s）短于窗口时，连不上上游会在窗口内以 502 透传，不走这里。
 - **不改写**：窗口内的所有响应（真实状态码原样透传）；4xx（含 429、401）；2xx 流中途出错（此时可能已转发部分内容，客户端重发会重复输出）；不可解码的 Content-Encoding；其他三种接口。
 - **取值**：去除前后空白后为空视同未设置；非空值只允许 `[a-z_]+`，否则启动失败。
 - **默认行为不变**：不设时输出与现状逐字节相同。

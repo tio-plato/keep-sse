@@ -6,7 +6,7 @@
 //! 关键规则：上游体若能解析出该 API 的标准错误 JSON，则整体原样嵌入（不改写字段）；
 //! 否则按下述模板合成，`message` 取错误体原文（截断至 4 KiB，无法解码时用状态行描述）。
 //! 唯一例外是 [`build_late`]：配置了 `--anthropic-late-error-type` 时，网关先回 200 之后的
-//! Anthropic 5xx/连接失败只改写 `error.type`，其余字段仍原样保留。
+//! Anthropic 5xx/请求失败改写 `error.type`；嵌入的上游 JSON 只改这一个字段。
 
 use bytes::Bytes;
 use hyper::StatusCode;
@@ -32,8 +32,8 @@ pub fn build(
 
 /// 网关已先回 200 之后（`bridge` 路径）的错误事件。
 ///
-/// `anthropic_type` 已设、接口为 Anthropic Messages、且上游为 5xx 或连接失败（`status` 为 `None`）时，
-/// 把 `error.type` 改写为 `anthropic_type`，其余字段不变；其余情况与 [`build`] 完全相同。
+/// `anthropic_type` 已设、接口为 Anthropic Messages、且上游为 5xx 或请求失败（`status` 为 `None`）时，
+/// 把 `error.type` 改写为 `anthropic_type`（嵌入的上游 JSON 只改这一个字段）；其余情况与 [`build`] 完全相同。
 pub fn build_late(
     kind: EndpointKind,
     status: Option<StatusCode>,
@@ -534,8 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn late_4xx_unchanged() {
-        for code in [400, 401, 429] {
+    fn late_non_5xx_unchanged() {
+        for code in [307, 400, 401, 429] {
             let late = build_late(
                 EndpointKind::AnthropicMessages,
                 s(code),
