@@ -1,17 +1,19 @@
-# Plan: 窗口超时发 200 时立即写一个心跳
+# Plan: SSE 包装通路的首个心跳立即到期
 
 ## 1. `tests/gateway.rs` — 先写测试
 
-- `test_delayed_200_sent_at_window`：1 s 间隔，上游 3 s 后才回响应头。客户端在 1.6 s 内应读到 `HTTP/1.1 200` 和第一个 `:\n\n`；随后仍能收到上游数据。
-- 改前运行：1.6 s 超时失败（第一个字节在 2 s）。
+- 辅助函数 `read_head_and_first_heartbeat`：在期限内读到响应头与第一个 `:\n\n`，提前 EOF 或超时都失败。
+- `test_delayed_200_sent_at_window`：2 s 间隔，上游 5 s 后才回响应头；3 s 内应收到 `HTTP/1.1 200` 与首个心跳（改前在 4 s）。
+- `test_passthrough_headers_sent_without_waiting_for_data`：2 s 间隔，上游立即回响应头、3 s 后才发数据；1 s 内应收到透传的响应头（含 `x-request-id`）与首个心跳（改前在 2 s）。
+- 各自在对应改动撤销时失败。
 
-## 2. `src/sse.rs` — `bridge` 开头写心跳
+## 2. `src/sse.rs`
 
-- 创建 `SseWriter` 后立即 `write_event(HEARTBEAT)`，失败则返回。
+- `bridge` 与 `passthrough_sse_response` 的心跳计时器初值改为 `Duration::ZERO`。
 
 ## 3. `README.md`
 
-- 「已知取舍」中"窗口超时则网关先行发出 200"补上"并立即写一个心跳注释"。
+- 「已知取舍」补上首个心跳立即到期、第一个字节不晚于一个间隔。
 
 ## 4. 验证
 

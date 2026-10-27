@@ -177,16 +177,9 @@ async fn bridge(
     upstream_fut: ResponseFuture,
 ) {
     let mut writer = SseWriter::new(tx);
-    // 网关刚发出 200：立即写一个心跳。hyper 在响应体出现第一个字节前不会写出响应头，
-    // 不写的话客户端要到下一个间隔才收到任何字节，前面按读超时计时的代理可能已经断开。
-    if writer
-        .write_event(Bytes::from_static(HEARTBEAT))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let mut heartbeat = Box::pin(tokio::time::sleep(interval));
+    // 首个心跳立即到期：hyper 在响应体出现第一个字节前不会写出响应头，
+    // 否则客户端要到下一个间隔才收到任何字节，前面按读超时计时的代理可能已经断开。
+    let mut heartbeat = Box::pin(tokio::time::sleep(Duration::ZERO));
     let mut upstream_fut = upstream_fut;
 
     // 阶段 1：等待上游响应，同时保活。
@@ -292,7 +285,8 @@ async fn passthrough_sse_response(
 
     tokio::task::spawn(async move {
         let mut writer = SseWriter::new(tx);
-        let mut heartbeat = Box::pin(tokio::time::sleep(interval));
+        // 同 bridge：首个心跳立即到期，透传的响应头随之发出，不必等上游的第一个字节。
+        let mut heartbeat = Box::pin(tokio::time::sleep(Duration::ZERO));
         handle_success(
             &mut writer,
             &mut heartbeat,

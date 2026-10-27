@@ -1406,20 +1406,28 @@ async fn test_late_undecodable_encoding_not_rewritten() {
     gw_tx.send(()).unwrap();
 }
 
-#[tokio::test]
-async fn test_delayed_200_sent_at_window() {
-    // 窗口超时网关发 200 时，响应头与首个心跳应立即发出，而不是再等一个间隔
-    let (upstream, tx) = start_mock_raw(|_b, _p| {
-        (
-            200,
-            vec![("content-type", "text/event-stream".to_string())],
-            3000, // 响应头延迟 3s，超过两个 1s 间隔
-            vec![(b"data: hello\n\n".to_vec(), 0)],
-        )
+/// 读到响应头与第一个心跳为止；`deadline` 内读不到则测试失败。
+async fn read_head_and_first_heartbeat(
+    stream: &mut tokio::net::TcpStream,
+    deadline: Duration,
+) -> String {
+    let got = tokio::time::timeout(deadline, async {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !got.windows(3).any(|w| w == b":\n\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "首个心跳之前连接就关闭了: {got:?}");
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
     })
-    .await;
-    let (gw, gw_tx) = start_gateway(upstream, 1).await;
+    .await
+    .expect("deadline 内应收到响应头与首个心跳");
+    String::from_utf8_lossy(&got).into_owned()
+}
 
+/// 发一个 Anthropic 流式请求（Connection: close），返回连接。
+async fn open_anthropic_stream(gw: SocketAddr) -> tokio::net::TcpStream {
     let body = r#"{"stream":true}"#;
     let req = format!(
         "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
@@ -1428,24 +1436,58 @@ async fn test_delayed_200_sent_at_window() {
     );
     let mut stream = tokio::net::TcpStream::connect(gw).await.unwrap();
     stream.write_all(req.as_bytes()).await.unwrap();
+    stream
+}
 
-    // 1s 窗口到期即应收到；第二个间隔（2s）才有字节就说明首个心跳没有立即写出。
-    let head = tokio::time::timeout(Duration::from_millis(1600), async {
-        let mut got = Vec::new();
-        let mut buf = [0u8; 1024];
-        while !got.windows(3).any(|w| w == b":\n\n") {
-            let n = stream.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            got.extend_from_slice(&buf[..n]);
-        }
-        got
+#[tokio::test]
+async fn test_delayed_200_sent_at_window() {
+    // 窗口超时网关发 200 时，响应头与首个心跳应在窗口到期时发出，而不是再等一个间隔
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            5000, // 响应头延迟 5s，超过两个 2s 间隔
+            vec![(b"data: hello\n\n".to_vec(), 0)],
+        )
     })
-    .await
-    .expect("1.6s 内应收到网关的 200 响应头与首个心跳");
-    let head = String::from_utf8_lossy(&head).into_owned();
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 2).await;
+
+    let mut stream = open_anthropic_stream(gw).await;
+    // 2s 窗口到期即应收到；不立即写心跳时第一个字节要到 4s。
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_secs(3)).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    assert!(String::from_utf8_lossy(&rest).contains("hello"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_passthrough_headers_sent_without_waiting_for_data() {
+    // 窗口内上游先回 SSE 响应头、数据迟迟不来：透传的响应头应立即随首个心跳发出
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![
+                ("content-type", "text/event-stream".to_string()),
+                ("x-request-id", "req-early".to_string()),
+            ],
+            0,
+            vec![(b"data: hello\n\n".to_vec(), 3000)], // 数据 3s 后才到
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 2).await;
+
+    let mut stream = open_anthropic_stream(gw).await;
+    // 不立即写心跳时第一个字节要到 2s（第一个间隔）。
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_secs(1)).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("req-early"), "{head}");
 
     let mut rest = Vec::new();
     stream.read_to_end(&mut rest).await.unwrap();
