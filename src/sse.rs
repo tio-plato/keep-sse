@@ -177,6 +177,15 @@ async fn bridge(
     upstream_fut: ResponseFuture,
 ) {
     let mut writer = SseWriter::new(tx);
+    // 网关刚发出 200：立即写一个心跳。hyper 在响应体出现第一个字节前不会写出响应头，
+    // 不写的话客户端要到下一个间隔才收到任何字节，前面按读超时计时的代理可能已经断开。
+    if writer
+        .write_event(Bytes::from_static(HEARTBEAT))
+        .await
+        .is_err()
+    {
+        return;
+    }
     let mut heartbeat = Box::pin(tokio::time::sleep(interval));
     let mut upstream_fut = upstream_fut;
 
