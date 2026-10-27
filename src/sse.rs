@@ -117,6 +117,7 @@ pub async fn handle_stream(
     kind: EndpointKind,
 ) -> Response<RespBody> {
     let interval = cfg.heartbeat_interval;
+    let window_end = tokio::time::Instant::now() + interval;
 
     // 构建上游请求并发起，与心跳间隔赛跑。
     let upstream_req = build_upstream_request(&cfg, parts, body);
@@ -132,7 +133,7 @@ pub async fn handle_stream(
                     let is_sse = is_event_stream(headers);
                     if status.is_success() && is_sse {
                         if let Some(ce) = upstream_ce {
-                            passthrough_sse_response(resp, kind, ce, interval).await
+                            passthrough_sse_response(resp, kind, ce, interval, window_end).await
                         } else {
                             proxy::passthrough_response(resp)
                         }
@@ -146,7 +147,7 @@ pub async fn handle_stream(
                 }
             }
         }
-        _ = tokio::time::sleep(interval) => {
+        _ = tokio::time::sleep_until(window_end) => {
             // 窗口超时：网关自行发 200 SSE，后台继续桥接上游。
             let (tx, resp_body) = sse_channel();
 
@@ -256,6 +257,7 @@ async fn passthrough_sse_response(
     kind: EndpointKind,
     upstream_ce: Coding,
     interval: Duration,
+    window_end: tokio::time::Instant,
 ) -> Response<RespBody> {
     let (mut parts, body) = resp.into_parts();
 
@@ -271,8 +273,9 @@ async fn passthrough_sse_response(
 
     tokio::task::spawn(async move {
         let mut writer = SseWriter::new(tx);
-        // 同 bridge：首个心跳立即到期，透传的响应头随之发出，不必等上游的第一个字节。
-        let mut heartbeat = Box::pin(tokio::time::sleep(Duration::ZERO));
+        // 首个心跳在窗口截止时到期：上游数据在那之前没到，透传的响应头随心跳发出，
+        // 不再多等一个间隔；数据先到则响应体与上游逐字节相同。
+        let mut heartbeat = Box::pin(tokio::time::sleep_until(window_end));
         handle_success(
             &mut writer,
             &mut heartbeat,

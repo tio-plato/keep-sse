@@ -1316,8 +1316,8 @@ async fn test_delayed_200_sent_at_window() {
 }
 
 #[tokio::test]
-async fn test_passthrough_headers_sent_without_waiting_for_data() {
-    // 窗口内上游先回 SSE 响应头、数据迟迟不来：透传的响应头应立即随首个心跳发出
+async fn test_passthrough_headers_sent_by_window_end() {
+    // 窗口内上游回了 SSE 响应头、数据迟迟不来：透传的响应头应在窗口截止时随首个心跳发出
     let (upstream, tx) = start_mock_raw(|_b, _p| {
         (
             200,
@@ -1325,22 +1325,47 @@ async fn test_passthrough_headers_sent_without_waiting_for_data() {
                 ("content-type", "text/event-stream".to_string()),
                 ("x-request-id", "req-early".to_string()),
             ],
-            0,
-            vec![(b"data: hello\n\n".to_vec(), 3000)], // 数据 3s 后才到
+            1500,                                      // 响应头在 2s 窗口内的 1.5s 到达
+            vec![(b"data: hello\n\n".to_vec(), 3500)], // 数据再过 3.5s 才到
         )
     })
     .await;
     let (gw, gw_tx) = start_gateway(upstream, 2).await;
 
     let mut stream = open_anthropic_stream(gw).await;
-    // 不立即写心跳时第一个字节要到 2s（第一个间隔）。
-    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_secs(1)).await;
+    // 窗口截止（2s）即应收到；按响应头到达后再等一个间隔算，第一个字节要到 3.5s。
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_millis(2800)).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert!(head.contains("req-early"), "{head}");
 
     let mut rest = Vec::new();
     stream.read_to_end(&mut rest).await.unwrap();
     assert!(String::from_utf8_lossy(&rest).contains("hello"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_passthrough_byte_identical_before_window_end() {
+    // 上游数据在窗口截止前到达：透传的响应体与上游逐字节相同，开头不插心跳
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            0,
+            vec![(b"data: hello\n\n".to_vec(), 300)], // 数据 0.3s 后到，早于 2s 窗口截止
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 2).await;
+
+    let mut stream = open_anthropic_stream(gw).await;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let (status, _, body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8_lossy(&dechunk(&body)), "data: hello\n\n");
 
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
