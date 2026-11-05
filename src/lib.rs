@@ -90,8 +90,11 @@ pub async fn handle(
                 .unwrap_or_default(),
             None => collected.to_vec(),
         };
+        // 探测用的副本不随请求留着：先攒后发要等到回复收全，多一份请求体会翻倍占用内存。
+        let is_stream = probe_stream_flag(&probe_body);
+        drop(probe_body);
 
-        if probe_stream_flag(&probe_body) {
+        if is_stream {
             return Ok(sse::handle_stream(cfg, client, parts, collected, kind, arrived).await);
         }
 

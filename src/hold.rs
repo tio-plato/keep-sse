@@ -338,6 +338,8 @@ async fn drive(
             break Finish::Cancelled;
         }
     };
+    // 不会再重试了，请求体不必陪着直播阶段留到最后。
+    drop(template);
 
     let interval = cfg.heartbeat_interval;
     let (outcome, detail) = match finish {
