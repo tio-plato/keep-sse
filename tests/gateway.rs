@@ -2219,19 +2219,19 @@ async fn test_hold_client_disconnect_after_200_cancels() {
     let (upstream, log, tx) = start_mock_seq(|_| {
         let ev = anthropic_reply("slow");
         let mut r = sse_reply(vec![ev[0].clone(), ev[1].clone()], 0, false);
-        r.chunks[1].1 = 5000; // 第二个事件 5 s 后才到
+        r.chunks[1].1 = 8000; // 第二个事件 8 s 后才到
         r
     })
     .await;
-    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 1)).await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 2)).await;
 
     let mut stream = open_hold_stream(gw).await;
-    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_millis(1500)).await;
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_millis(2800)).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     drop(stream);
 
-    // 不等下一个心跳（1 s 后）写失败才发现。
-    let closed = tokio::time::timeout(Duration::from_millis(500), async {
+    // 不等下一个心跳（2 s 后）写失败才发现。
+    let closed = tokio::time::timeout(Duration::from_millis(1200), async {
         while !log.lock().closed_early.first().copied().unwrap_or(false) {
             sleep(Duration::from_millis(10)).await;
         }
