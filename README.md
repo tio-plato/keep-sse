@@ -19,7 +19,7 @@ LLM 流式响应中，上游在首包前或流中间可能有长时间停顿（�
 | `--max-probe-body` | `KEEP_SSE_MAX_PROBE_BODY` | `33554432` | 流式探测请求体缓冲上限（字节） |
 | `--anthropic-late-error-type` | `KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE` | 不设 | 网关先回 200 之后，上游返回 5xx 或请求失败（如连上后未回响应头就断开）时，Anthropic 错误事件改写成的 `error.type`（如 `overloaded_error`），只允许 `[a-z_]+`；见「错误事件格式」 |
 | `--hold-window` | `KEEP_SSE_HOLD_WINDOW` | `0` | 先攒后发的窗口（秒）：Anthropic Messages 流式回复每次从上游第一个字节起最多攒这么久；`0` 关闭；见「断流重试」 |
-| `--retry-deadline` | `KEEP_SSE_RETRY_DEADLINE` | `180` | 状态码或连接失败后，请求到达多少秒内还能发起新的一次 |
+| `--retry-deadline` | `KEEP_SSE_RETRY_DEADLINE` | `180` | 状态码或请求失败后，请求到达（或上一次流到一半断）多少秒内还能发起新的一次 |
 | `--max-stream-retries` | `KEEP_SSE_MAX_STREAM_RETRIES` | `3` | 流到一半断（还没写给客户端）后最多重试几次 |
 | `--hold-max-bytes` | `KEEP_SSE_HOLD_MAX_BYTES` | `8388608` | 攒着的回复超过这么多字节就提交（转为直播） |
 | `--hold-max-body` | `KEEP_SSE_HOLD_MAX_BODY` | `16777216` | 请求体超过这么多字节就不攒、不重试 |
@@ -94,7 +94,7 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 
 何时重试：
 
-- 状态码 500、502、503、504、529，或上游请求失败（连不上，或连上后未回响应头就断开）：只在请求到达后 `--retry-deadline` 秒内发起新的一次。
+- 状态码 500、502、503、504、529，或上游请求失败（连不上，或连上后未回响应头就断开）：只在请求到达后 `--retry-deadline` 秒内发起新的一次；流到一半断过的，从最近一次断开时重新算（上游断流后常紧接着一段拒连）。
 - 流到一半断，即上游流读出错、没有 `message_stop` 就结束，或收到 `event: error` 且 `error.type` 不是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`request_too_large`、`billing_error`、`rate_limit_error`：不受时限限制，每个请求最多 `--max-stream-retries` 次。
 - 退避按已重试次数取 1、2、4、8 s，之后每次 8 s。
 - 其他状态码（400、401、403、404、413、429 等）立即照原样交出；上面名单里的 error 事件随已攒的事件一起交给客户端。

@@ -9,7 +9,7 @@
 | 参数 | 环境变量 | 默认值 | 含义 |
 |---|---|---|---|
 | `--hold-window` | `KEEP_SSE_HOLD_WINDOW` | `0` | 每次尝试从上游第一个字节起最多攒多少秒；0 关闭整个功能 |
-| `--retry-deadline` | `KEEP_SSE_RETRY_DEADLINE` | `180` | 状态码或连接失败后，请求到达多少秒内还能发起新的一次 |
+| `--retry-deadline` | `KEEP_SSE_RETRY_DEADLINE` | `180` | 状态码或请求失败后，请求到达（或上一次流断）多少秒内还能发起新的一次 |
 | `--max-stream-retries` | `KEEP_SSE_MAX_STREAM_RETRIES` | `3` | 流到一半断后最多重试几次 |
 | `--hold-max-bytes` | `KEEP_SSE_HOLD_MAX_BYTES` | `8388608` | 攒着的回复超过这么多字节就提交 |
 | `--hold-max-body` | `KEEP_SSE_HOLD_MAX_BODY` | `16777216` | 请求体超过这么多字节就不攒、不重试 |
@@ -78,7 +78,7 @@ W 从本次第一个字节起算，用一个只在收到第一个字节后才启
 ### 重试
 
 - 退避按已重试次数取 1、2、4、8 s，之后每次 8 s；状态码失败与流断共用这个序列。
-- 状态码、请求失败：`now + 退避 <= arrived + retry_deadline` 才重试，否则交出这次的结果。时长大到加不上去时视为没有时限；`hold_window` 同理，视为不按时间提交。
+- 状态码、请求失败：`now + 退避 <= 时限` 才重试，否则交出这次的结果。时限起初是 `arrived + retry_deadline`，每次重试流断时改为 `断开时刻 + retry_deadline`。时长大到加不上去时视为没有时限；`hold_window` 同理，视为不按时间提交。
 - 流断：`stream_retries < max_stream_retries` 才重试，不看时限。
 - 要重试时丢弃这次的响应（hyper client 关闭该连接）和已攒的字节。
 

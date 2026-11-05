@@ -16,7 +16,7 @@
 - **请求体上限**：攒着时请求体要一直留在内存里直到请求结束；请求体超过 `--hold-max-body` 的请求不攒、不重试，按现在的方式转发。
 - **成功**：只认 `event: message_stop` 加上游 body 正常结束，不依赖上游断流时写的 error 事件的具体内容。
 - **可重试**：
-  - 状态码 500、502、503、504、529，或连接上游失败；只在请求到达后 `--retry-deadline` 秒内发起新的一次。
+  - 状态码 500、502、503、504、529，或上游请求失败；只在请求到达后 `--retry-deadline` 秒内发起新的一次。流到一半断过的，时限从最近一次断开时重新算：上游断流后常紧接着一段拒连，首字节来得晚的请求也要能等过去。
   - 流到一半断（读出错、没有 `message_stop` 就结束、收到类型不在下列名单里的 `event: error`）；不受 `--retry-deadline` 限制，每个请求最多 `--max-stream-retries` 次。
 - **不可重试**：其他状态码（400、401、403、404、413、429 等）照现在的方式立即交出；`error.type` 为 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`request_too_large`、`billing_error`、`rate_limit_error` 的 error 事件随已攒的事件一起交给客户端。
 - **提交**：一次尝试从上游第一个字节起攒满 `--hold-window` 秒，或缓存超过 `--hold-max-bytes`，就把已攒的部分写给客户端，转为现在的直播行为；之后再出错和现在一样，不再重试。

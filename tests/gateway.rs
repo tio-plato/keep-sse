@@ -2267,3 +2267,34 @@ async fn test_hold_client_disconnect_during_backoff_cancels() {
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
 }
+
+#[tokio::test]
+async fn test_hold_status_retry_deadline_restarts_after_stream_break() {
+    // 重试时限 4 s：第一次 4.5 s 才断流（已过时限），重试碰上 502；时限从断流时重新算，
+    // 502 之后还能再试一次并成功
+    let (upstream, log, tx) = start_mock_seq(|i| match i {
+        0 => {
+            let mut ev = anthropic_reply("first");
+            ev.truncate(2);
+            let mut r = sse_reply(ev, 0, true);
+            r.header_delay_ms = 4500;
+            r
+        }
+        1 => status_reply(502, SUB2API_502_BODY),
+        _ => sse_reply(anthropic_reply("third"), 0, false),
+    })
+    .await;
+    let cfg = ResolvedConfig {
+        retry_deadline: Duration::from_secs(4),
+        ..hold_cfg(upstream, 60)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, concat(&anthropic_reply("third")));
+    assert_eq!(log.lock().bodies.len(), 3);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}

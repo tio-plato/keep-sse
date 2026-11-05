@@ -260,8 +260,9 @@ async fn drive(
     mut down: Downstream,
 ) {
     let late_type = cfg.anthropic_late_error_type.as_deref();
-    // 时长大到加不上去时视为没有时限。
-    let deadline = arrived.checked_add(cfg.retry_deadline);
+    // 状态码与请求失败的重试时限：从请求到达起算，每次流断后从断开时重新算（上游断流后
+    // 往往紧接着一段拒连，首字节来得晚的请求也要能等过去）。时长大到加不上去时视为没有时限。
+    let mut deadline = arrived.checked_add(cfg.retry_deadline);
     let mut report = Report {
         arrived,
         started,
@@ -305,11 +306,12 @@ async fn drive(
                 format!("request error: {}", error_chain(&e)),
                 past_deadline.then(|| Finish::Deliver(Err(e))),
             ),
-            // 流断：不受时限限制，只受次数限制。
+            // 流断：不受时限限制，只受次数限制；重试时限从这里重新算。
             Attempt::Stream(reason) => {
                 let give_up = report.stream_retries >= cfg.max_stream_retries;
                 if !give_up {
                     report.stream_retries += 1;
+                    deadline = Instant::now().checked_add(cfg.retry_deadline);
                 }
                 (
                     reason.clone(),
