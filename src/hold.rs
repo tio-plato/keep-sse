@@ -644,12 +644,20 @@ impl EventScanner {
                 self.event.extend_from_slice(value);
             }
             b"data" => {
-                if !self.data.is_empty() {
+                if self.data_cut {
+                    return;
+                }
+                let sep = usize::from(!self.data.is_empty());
+                if cut || self.data.len() + sep + value.len() > MAX_FIELD {
+                    // 超限的 data 解析不出类型，不再保留。
+                    self.data_cut = true;
+                    self.data.clear();
+                    return;
+                }
+                if sep == 1 {
                     self.data.push(b'\n');
                 }
-                let room = MAX_FIELD.saturating_sub(self.data.len());
-                self.data_cut |= cut || value.len() > room;
-                self.data.extend_from_slice(&value[..value.len().min(room)]);
+                self.data.extend_from_slice(value);
             }
             _ => {}
         }
@@ -766,6 +774,18 @@ mod tests {
             "x".repeat(MAX_FIELD)
         );
         let s = scan(&[big.as_bytes()]);
+        assert_eq!(s.error, Some(None));
+    }
+
+    #[test]
+    fn data_stays_within_cap_over_many_lines() {
+        let mut s = EventScanner::default();
+        s.feed(b"event: error\n");
+        for _ in 0..100_000 {
+            s.feed(b"data: x\n");
+        }
+        assert!(s.data.len() <= MAX_FIELD, "{}", s.data.len());
+        s.feed(b"\n");
         assert_eq!(s.error, Some(None));
     }
 
