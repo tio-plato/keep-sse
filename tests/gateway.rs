@@ -140,6 +140,11 @@ fn test_cfg(upstream: SocketAddr, heartbeat: u64, max_probe_body: usize) -> Reso
         max_probe_body,
         shutdown_timeout: Duration::from_secs(30),
         anthropic_late_error_type: None,
+        hold_window: Duration::ZERO,
+        retry_deadline: Duration::from_secs(180),
+        max_stream_retries: 3,
+        hold_max_bytes: 8 * 1024 * 1024,
+        hold_max_body: 16 * 1024 * 1024,
     }
 }
 

@@ -19,6 +19,7 @@ use crate::config::ResolvedConfig;
 use crate::detect::EndpointKind;
 use crate::encoding::{self, Coding, DecodedStream, SseWriter};
 use crate::error_event;
+use crate::hold;
 use crate::proxy::{self, BoxError, ReqBody, RespBody};
 
 pub(crate) const HEARTBEAT: &[u8] = b":\n\n";
@@ -126,13 +127,26 @@ pub(crate) fn gateway_sse_response(body: RespBody) -> Response<RespBody> {
 /// SSE 包装通路入口。
 ///
 /// 与上游响应赛跑一个心跳间隔：窗口内上游返回则透传/桥接，超时则自行发 200 SSE。
+/// Anthropic Messages 在打开先攒后发时转给 [`hold::handle`]；`arrived` 是请求到达网关的时刻。
 pub async fn handle_stream(
     cfg: ResolvedConfig,
     client: Client<HttpConnector, ReqBody>,
     parts: Parts,
     body: Bytes,
     kind: EndpointKind,
+    arrived: tokio::time::Instant,
 ) -> Response<RespBody> {
+    if kind == EndpointKind::AnthropicMessages && !cfg.hold_window.is_zero() {
+        if body.len() <= cfg.hold_max_body {
+            return hold::handle(cfg, client, parts, body, kind, arrived).await;
+        }
+        tracing::info!(
+            body_len = body.len(),
+            hold_max_body = cfg.hold_max_body,
+            "request body exceeds hold-max-body; not holding"
+        );
+    }
+
     let interval = cfg.heartbeat_interval;
     let window_end = tokio::time::Instant::now() + interval;
     let late_type = cfg.anthropic_late_error_type.clone();

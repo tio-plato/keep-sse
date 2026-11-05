@@ -6,6 +6,7 @@ pub mod config;
 pub mod detect;
 pub mod encoding;
 pub mod error_event;
+mod hold;
 #[cfg(feature = "pprof")]
 pub mod pprof;
 pub mod proxy;
@@ -41,6 +42,7 @@ pub async fn handle(
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, Infallible> {
     if let Some(kind) = match_endpoint(req.method(), req.uri().path(), req.uri().query()) {
+        let arrived = tokio::time::Instant::now();
         let content_length = req
             .headers()
             .get(CONTENT_LENGTH)
@@ -74,11 +76,11 @@ pub async fn handle(
         };
 
         if kind == EndpointKind::GeminiStream {
-            return Ok(sse::handle_stream(cfg, client, parts, collected, kind).await);
+            return Ok(sse::handle_stream(cfg, client, parts, collected, kind, arrived).await);
         }
 
         if accepts_event_stream(&parts.headers) {
-            return Ok(sse::handle_stream(cfg, client, parts, collected, kind).await);
+            return Ok(sse::handle_stream(cfg, client, parts, collected, kind, arrived).await);
         }
 
         let content_encoding = parse_content_encoding(&parts.headers);
@@ -90,7 +92,7 @@ pub async fn handle(
         };
 
         if probe_stream_flag(&probe_body) {
-            return Ok(sse::handle_stream(cfg, client, parts, collected, kind).await);
+            return Ok(sse::handle_stream(cfg, client, parts, collected, kind, arrived).await);
         }
 
         return Ok(proxy_buffered(&cfg, &client, parts, collected).await);

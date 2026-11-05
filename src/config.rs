@@ -36,6 +36,27 @@ pub struct Config {
     /// 不设则按现有映射。
     #[arg(long, env = "KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE")]
     pub anthropic_late_error_type: Option<String>,
+
+    /// 先攒后发的窗口（秒）：Anthropic Messages 流式回复从上游第一个字节起最多攒这么久，
+    /// 收全再一次发出，没收全前上游断了就重试；0 关闭（默认）。
+    #[arg(long, env = "KEEP_SSE_HOLD_WINDOW", default_value_t = 0)]
+    pub hold_window: u64,
+
+    /// 状态码失败或连接失败后，请求到达多少秒内还能发起新的一次。
+    #[arg(long, env = "KEEP_SSE_RETRY_DEADLINE", default_value_t = 180)]
+    pub retry_deadline: u64,
+
+    /// 流到一半断（还没写给客户端）后最多重试几次，不受 `--retry-deadline` 限制。
+    #[arg(long, env = "KEEP_SSE_MAX_STREAM_RETRIES", default_value_t = 3)]
+    pub max_stream_retries: u32,
+
+    /// 攒着的回复超过这么多字节就不再攒，转为直播。
+    #[arg(long, env = "KEEP_SSE_HOLD_MAX_BYTES", default_value_t = 8 * 1024 * 1024)]
+    pub hold_max_bytes: usize,
+
+    /// 请求体超过这么多字节就不攒、不重试（攒着时请求体要一直留在内存里）。
+    #[arg(long, env = "KEEP_SSE_HOLD_MAX_BODY", default_value_t = 16 * 1024 * 1024)]
+    pub hold_max_body: usize,
 }
 
 /// 校验后的运行时配置。`upstream` 已解析为 `Uri`。
@@ -49,6 +70,12 @@ pub struct ResolvedConfig {
     pub max_probe_body: usize,
     pub shutdown_timeout: std::time::Duration,
     pub anthropic_late_error_type: Option<String>,
+    /// 为零时先攒后发关闭。
+    pub hold_window: std::time::Duration,
+    pub retry_deadline: std::time::Duration,
+    pub max_stream_retries: u32,
+    pub hold_max_bytes: usize,
+    pub hold_max_body: usize,
 }
 
 impl ResolvedConfig {
@@ -102,6 +129,11 @@ impl ResolvedConfig {
             max_probe_body: cfg.max_probe_body,
             shutdown_timeout: std::time::Duration::from_secs(cfg.shutdown_timeout),
             anthropic_late_error_type,
+            hold_window: std::time::Duration::from_secs(cfg.hold_window),
+            retry_deadline: std::time::Duration::from_secs(cfg.retry_deadline),
+            max_stream_retries: cfg.max_stream_retries,
+            hold_max_bytes: cfg.hold_max_bytes,
+            hold_max_body: cfg.hold_max_body,
         })
     }
 }
