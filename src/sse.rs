@@ -9,7 +9,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::header::{
     HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
 };
-use hyper::http::request::Parts;
+use hyper::http::{request::Parts, response};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::{connect::HttpConnector, Client, ResponseFuture};
 use tokio::sync::mpsc;
@@ -17,24 +17,27 @@ use tokio_stream::StreamExt as _;
 
 use crate::config::ResolvedConfig;
 use crate::detect::EndpointKind;
-use crate::encoding::{self, Coding, SseWriter};
+use crate::encoding::{self, Coding, DecodedStream, SseWriter};
 use crate::error_event;
 use crate::proxy::{self, BoxError, ReqBody, RespBody};
 
-const HEARTBEAT: &[u8] = b":\n\n";
+pub(crate) const HEARTBEAT: &[u8] = b":\n\n";
+
+/// 心跳计时器。
+pub(crate) type Heartbeat = std::pin::Pin<Box<tokio::time::Sleep>>;
 
 /// 错误体读取与解压上限（字节）。
 const MAX_ERROR_BODY: usize = 1024 * 1024;
 
 /// SSE 事件边界跟踪器：观察下行 SSE 字节流，判断是否处于事件边界（流开头或上一事件已以空行终结）。
-struct EventBoundaryTracker {
+pub(crate) struct EventBoundaryTracker {
     at_boundary: bool,
     line_empty: bool,
     prev_cr: bool,
 }
 
 impl EventBoundaryTracker {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             at_boundary: true,
             line_empty: true,
@@ -43,7 +46,7 @@ impl EventBoundaryTracker {
     }
 
     /// 观察一段写入的字节，更新边界状态。`\r`、`\n`、`\r\n` 均为行终结符，后者只算一次。
-    fn feed(&mut self, bytes: &[u8]) {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
         let mut pos = 0;
         loop {
             match memchr::memchr2(b'\n', b'\r', &bytes[pos..]) {
@@ -97,13 +100,27 @@ impl EventBoundaryTracker {
 }
 
 /// 构建下行 SSE 帧通道：返回 (sender, response body)。
-fn sse_channel() -> (mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>, RespBody) {
+pub(crate) fn sse_channel() -> (mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>, RespBody) {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = StreamBody::new(stream)
         .map_err(|e: std::io::Error| -> BoxError { Box::new(e) })
         .boxed();
     (tx, body)
+}
+
+/// 窗口超时时网关自己发出的 200 SSE 响应。
+pub(crate) fn gateway_sse_response(body: RespBody) -> Response<RespBody> {
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::OK;
+    let resp_headers = resp.headers_mut();
+    resp_headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    resp_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    resp_headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    resp
 }
 
 /// SSE 包装通路入口。
@@ -151,20 +168,8 @@ pub async fn handle_stream(
         _ = tokio::time::sleep_until(window_end) => {
             // 窗口超时：网关自行发 200 SSE，后台继续桥接上游。
             let (tx, resp_body) = sse_channel();
-
-            let mut resp = Response::new(resp_body);
-            *resp.status_mut() = StatusCode::OK;
-            let resp_headers = resp.headers_mut();
-            resp_headers.insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream; charset=utf-8"),
-            );
-            resp_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-            resp_headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-
             tokio::task::spawn(bridge(kind, interval, late_type, tx, upstream_fut));
-
-            resp
+            gateway_sse_response(resp_body)
         }
     }
 }
@@ -198,6 +203,27 @@ async fn bridge(
         }
     };
 
+    deliver_late(
+        &mut writer,
+        &mut heartbeat,
+        interval,
+        kind,
+        late_type.as_deref(),
+        upstream_resp,
+    )
+    .await;
+    writer.end().await;
+}
+
+/// 网关已先回 200 之后，把上游结果写给客户端：2xx 桥接 body，非 2xx 与请求失败写错误事件。
+pub(crate) async fn deliver_late(
+    writer: &mut SseWriter,
+    heartbeat: &mut Heartbeat,
+    interval: Duration,
+    kind: EndpointKind,
+    late_type: Option<&str>,
+    upstream_resp: Result<Response<Incoming>, hyper_util::client::legacy::Error>,
+) {
     match upstream_resp {
         Ok(resp) => {
             let status = resp.status();
@@ -205,52 +231,25 @@ async fn bridge(
             let upstream_ce = encoding::parse_content_encoding(&resp_parts.headers);
 
             if status.is_success() {
-                handle_success(
-                    &mut writer,
-                    &mut heartbeat,
-                    interval,
-                    kind,
-                    upstream_ce,
-                    resp_body,
-                )
-                .await;
-            } else if let Some(error_body) = read_error_body(
-                &mut writer,
-                &mut heartbeat,
-                interval,
-                upstream_ce,
-                resp_body,
-            )
-            .await
+                handle_success(writer, heartbeat, interval, kind, upstream_ce, resp_body).await;
+            } else if let Some(error_body) =
+                read_error_body(writer, heartbeat, interval, upstream_ce, resp_body).await
             {
-                let ev = error_event::build_late(
-                    kind,
-                    Some(status),
-                    Some(&error_body),
-                    None,
-                    late_type.as_deref(),
-                );
+                let ev =
+                    error_event::build_late(kind, Some(status), Some(&error_body), None, late_type);
                 let _ = writer.write_event(ev).await;
             }
         }
         Err(e) => {
             tracing::warn!(error = %e, "upstream request failed (sse)");
-            let ev = error_event::build_late(
-                kind,
-                None,
-                None,
-                Some(&e.to_string()),
-                late_type.as_deref(),
-            );
+            let ev = error_event::build_late(kind, None, None, Some(&e.to_string()), late_type);
             let _ = writer.write_event(ev).await;
         }
     }
-
-    writer.end().await;
 }
 
 /// 判断响应 `Content-Type` 是否为 `text/event-stream`（取 `;` 前媒体类型，不区分大小写）。
-fn is_event_stream(headers: &HeaderMap) -> bool {
+pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -274,13 +273,7 @@ async fn passthrough_sse_response(
     window_end: tokio::time::Instant,
 ) -> Response<RespBody> {
     let (mut parts, body) = resp.into_parts();
-
-    proxy::strip_hop_by_hop(&mut parts.headers);
-    parts.headers.remove(CONTENT_LENGTH);
-    parts.headers.remove(CONTENT_ENCODING);
-    parts
-        .headers
-        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    passthrough_head(&mut parts);
 
     let (tx, resp_body) = sse_channel();
     let resp = Response::from_parts(parts, resp_body);
@@ -305,16 +298,26 @@ async fn passthrough_sse_response(
     resp
 }
 
+/// 透传 2xx SSE 时的响应头：去掉 hop-by-hop、`Content-Length`、`Content-Encoding`（下行一律 identity）。
+pub(crate) fn passthrough_head(parts: &mut response::Parts) {
+    proxy::strip_hop_by_hop(&mut parts.headers);
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(CONTENT_ENCODING);
+    parts
+        .headers
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+}
+
 /// 处理 2xx 上游响应：流式解压并写入客户端。
 async fn handle_success(
     writer: &mut SseWriter,
-    heartbeat: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+    heartbeat: &mut Heartbeat,
     interval: Duration,
     kind: EndpointKind,
     upstream_ce: Option<Coding>,
     body: Incoming,
 ) {
-    let mut tracker = EventBoundaryTracker::new();
+    let tracker = EventBoundaryTracker::new();
     let Some(ce) = upstream_ce else {
         // 不可解码的 Content-Encoding → 错误事件。
         if !tracker.at_boundary {
@@ -331,8 +334,19 @@ async fn handle_success(
     };
 
     let stream = encoding::decoder_stream(ce, body);
-    tokio::pin!(stream);
+    bridge_stream(writer, heartbeat, interval, kind, stream, tracker).await;
+}
 
+/// 把已解码的上游流写给客户端：空闲时在事件边界注入心跳，流中途出错写错误事件。
+/// `tracker` 须已观察过此前写给客户端的字节。
+pub(crate) async fn bridge_stream(
+    writer: &mut SseWriter,
+    heartbeat: &mut Heartbeat,
+    interval: Duration,
+    kind: EndpointKind,
+    mut stream: DecodedStream,
+    mut tracker: EventBoundaryTracker,
+) {
     loop {
         tokio::select! {
             _ = &mut *heartbeat => {
@@ -376,7 +390,7 @@ async fn handle_success(
 /// 读取非 2xx 上游响应的错误体（解压，上限 1 MiB），期间照常发心跳；客户端已断开时返回 `None`。
 async fn read_error_body(
     writer: &mut SseWriter,
-    heartbeat: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+    heartbeat: &mut Heartbeat,
     interval: Duration,
     upstream_ce: Option<Coding>,
     body: Incoming,
@@ -412,6 +426,12 @@ async fn read_error_body(
 
 /// 构建上游请求：过滤 hop-by-hop、改写 Host 与 URI、body 为原始 Bytes。
 fn build_upstream_request(cfg: &ResolvedConfig, mut parts: Parts, body: Bytes) -> Request<ReqBody> {
+    prepare_upstream_parts(cfg, &mut parts);
+    Request::from_parts(parts, full_body(body))
+}
+
+/// 改写请求头与 URI 以发往上游：过滤 hop-by-hop、改写 Host 与 URI。
+pub(crate) fn prepare_upstream_parts(cfg: &ResolvedConfig, parts: &mut Parts) {
     let upstream_uri = proxy::upstream_uri(cfg, &parts.uri);
     let host_val = HeaderValue::from_str(&cfg.upstream_authority).expect("authority valid");
 
@@ -419,9 +439,11 @@ fn build_upstream_request(cfg: &ResolvedConfig, mut parts: Parts, body: Bytes) -
     parts.headers.insert(HOST, host_val);
     proxy::strip_hop_by_hop(&mut parts.headers);
     parts.uri = upstream_uri;
+}
 
-    let boxed = Full::new(body).map_err(|e: Infallible| match e {}).boxed();
-    Request::from_parts(parts, boxed)
+/// 已缓冲的请求体。
+pub(crate) fn full_body(body: Bytes) -> ReqBody {
+    Full::new(body).map_err(|e: Infallible| match e {}).boxed()
 }
 
 #[cfg(test)]

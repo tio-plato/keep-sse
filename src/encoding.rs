@@ -104,11 +104,11 @@ where
     BodyDataStream::new(body).map(|res| res.map_err(io::Error::other))
 }
 
+/// 解压后的上游响应流。
+pub type DecodedStream = Box<dyn Stream<Item = io::Result<Bytes>> + Send + Unpin>;
+
 /// 上游响应流式解压。输入为 `Body<Data = Bytes>`，输出 `Stream<Item = io::Result<Bytes>>`。
-pub fn decoder_stream<B>(
-    coding: Coding,
-    body: B,
-) -> Box<dyn Stream<Item = io::Result<Bytes>> + Send + Unpin>
+pub fn decoder_stream<B>(coding: Coding, body: B) -> DecodedStream
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
@@ -143,6 +143,11 @@ impl SseWriter {
             .send(Ok(Frame::data(bytes)))
             .await
             .map_err(|_| io::Error::other("client gone"))
+    }
+
+    /// 客户端断开（响应体被丢弃）时完成。
+    pub async fn closed(&self) {
+        self.tx.closed().await
     }
 
     /// 关闭下游通道。
