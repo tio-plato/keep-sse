@@ -2080,3 +2080,30 @@ async fn test_hold_beyond_heartbeat_window() {
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
 }
+
+#[tokio::test]
+async fn test_hold_huge_durations_do_not_panic() {
+    // 时长配得极大（如当作"无时限"）：重试时限和攒的窗口都加不上去，不能让后台任务 panic
+    let (upstream, log, tx) = start_mock_seq(|i| {
+        if i == 0 {
+            status_reply(502, SUB2API_502_BODY)
+        } else {
+            sse_reply(anthropic_reply("ok"), 0, false)
+        }
+    })
+    .await;
+    let cfg = ResolvedConfig {
+        retry_deadline: Duration::MAX,
+        hold_window: Duration::MAX,
+        ..hold_cfg(upstream, 60)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, concat(&anthropic_reply("ok")));
+    assert_eq!(log.lock().bodies.len(), 2);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}

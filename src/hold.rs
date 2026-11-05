@@ -178,14 +178,15 @@ async fn attempt(
     let mut chunks = Vec::new();
     let mut held = 0;
     let mut first_byte = None;
-    // 攒满 W 的计时器，收到第一个字节后才启用。
+    // 攒满 W 的计时器，收到第一个字节后才启用；W 大到加不上去时不启用。
     let until = tokio::time::sleep(window);
     tokio::pin!(until);
+    let mut windowed = false;
 
     loop {
         let next = tokio::select! {
             next = stream.next() => Some(next),
-            _ = &mut until, if first_byte.is_some() => None,
+            _ = &mut until, if windowed => None,
         };
         let Some(next) = next else {
             return Attempt::Commit(Held::new(head, chunks, first_byte), stream, Commit::Window);
@@ -195,7 +196,10 @@ async fn attempt(
                 if first_byte.is_none() {
                     let now = Instant::now();
                     first_byte = Some(now);
-                    until.as_mut().reset(now + window);
+                    if let Some(at) = now.checked_add(window) {
+                        until.as_mut().reset(at);
+                        windowed = true;
+                    }
                 }
                 scanner.feed(&bytes);
                 held += bytes.len();
@@ -242,7 +246,8 @@ async fn drive(
     mut down: Downstream,
 ) {
     let late_type = cfg.anthropic_late_error_type.as_deref();
-    let deadline = arrived + cfg.retry_deadline;
+    // 时长大到加不上去时视为没有时限。
+    let deadline = arrived.checked_add(cfg.retry_deadline);
     let mut report = Report {
         arrived,
         started,
@@ -272,7 +277,7 @@ async fn drive(
         };
 
         let backoff = backoff(report.attempts - 1);
-        let past_deadline = Instant::now() + backoff > deadline;
+        let past_deadline = deadline.is_some_and(|d| Instant::now() + backoff > d);
         let (reason, give_up) = match result {
             Attempt::Complete(held) => break Finish::Complete(held),
             Attempt::Commit(held, stream, why) => break Finish::Commit(held, stream, why),
