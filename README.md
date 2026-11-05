@@ -18,6 +18,11 @@ LLM 流式响应中，上游在首包前或流中间可能有长时间停顿（�
 | `--connect-timeout` | `KEEP_SSE_CONNECT_TIMEOUT` | `10` | 上游 TCP 连接超时（秒） |
 | `--max-probe-body` | `KEEP_SSE_MAX_PROBE_BODY` | `33554432` | 流式探测请求体缓冲上限（字节） |
 | `--anthropic-late-error-type` | `KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE` | 不设 | 网关先回 200 之后，上游返回 5xx 或请求失败（如连上后未回响应头就断开）时，Anthropic 错误事件改写成的 `error.type`（如 `overloaded_error`），只允许 `[a-z_]+`；见「错误事件格式」 |
+| `--hold-window` | `KEEP_SSE_HOLD_WINDOW` | `0` | 先攒后发的窗口（秒）：Anthropic Messages 流式回复每次从上游第一个字节起最多攒这么久；`0` 关闭；见「断流重试」 |
+| `--retry-deadline` | `KEEP_SSE_RETRY_DEADLINE` | `180` | 状态码或连接失败后，请求到达多少秒内还能发起新的一次 |
+| `--max-stream-retries` | `KEEP_SSE_MAX_STREAM_RETRIES` | `3` | 流到一半断（还没写给客户端）后最多重试几次 |
+| `--hold-max-bytes` | `KEEP_SSE_HOLD_MAX_BYTES` | `8388608` | 攒着的回复超过这么多字节就提交（转为直播） |
+| `--hold-max-body` | `KEEP_SSE_HOLD_MAX_BODY` | `16777216` | 请求体超过这么多字节就不攒、不重试 |
 
 ```sh
 keep-sse --listen 0.0.0.0:8080 --upstream http://localhost:11434
@@ -81,6 +86,32 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 
 上游体若能解析出该 API 的标准错误 JSON，则原样嵌入（不改写字段；`--anthropic-late-error-type` 是唯一例外）。
 
+## 断流重试
+
+`--hold-window` 大于 0 时，Anthropic Messages 的流式请求（请求体不超过 `--hold-max-body`）先攒后发：上游 2xx SSE 回复的事件先全部缓存，收到 `event: message_stop` 且上游 body 正常结束后一次写给客户端；在那之前上游断了，就用同一个请求（方法、路径、头、请求体）从头再发。其他三种接口、非流式请求不受影响。
+
+发给客户端的半截回复续不上（Messages API 没有断点续传，模型也不接受 assistant prefill），所以只重试客户端还没看到任何事件的回复。
+
+何时重试：
+
+- 状态码 500、502、503、504、529，或连接上游失败：只在请求到达后 `--retry-deadline` 秒内发起新的一次。
+- 流到一半断，即上游流读出错、没有 `message_stop` 就结束，或收到 `event: error` 且 `error.type` 不是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`request_too_large`、`billing_error`、`rate_limit_error`：不受时限限制，每个请求最多 `--max-stream-retries` 次。
+- 退避按已重试次数取 1、2、4、8 s，之后每次 8 s。
+- 其他状态码（400、401、403、404、413、429 等）立即照原样交出；上面名单里的 error 事件随已攒的事件一起交给客户端。
+
+何时提交：一次尝试从上游第一个字节起攒满 `--hold-window` 秒，或缓存超过 `--hold-max-bytes`，就把已攒的部分写给客户端，之后照常逐块转发；此后再出错和关闭时一样（发错误事件），不再重试。
+
+重试用完时：
+
+- 最后一次是状态码或连接失败：窗口内透传状态码与错误体（连接失败为 502），窗口后发错误事件（按 `--anthropic-late-error-type` 的规则改写）。
+- 最后一次是流到一半断：丢掉半截回复，窗口内回 502 与 Anthropic 错误 JSON（`api_error`，`upstream stream interrupted: ...`），窗口后发错误事件（按请求失败处理，同样适用迟到改写）。
+
+攒着、退避和重试期间心跳窗口照常：窗口内有结论就透传上游状态码与响应头，窗口到期先回 200 和心跳，之后每个间隔一个。客户端在这期间断开时，网关立即放弃当前上游请求，不再重试。
+
+每个走这条通路的请求结束时写一行 `info` 日志 `hold finished`，字段：`outcome`（`complete` 收全后一次发出 / `committed` 转为直播 / `error` 交给客户端的是错误 / `cancelled` 客户端先断开）、`detail`、`attempts`、`stream_retries`、`hold_ms`（最后一次从第一个字节到写给客户端）、`total_ms`、`body_read_ms`、`failures`（每次失败的原因）；每次重试另写一行 `warn`。日志不含请求体、响应体和头。
+
+计费提示：每次重试对上游都是一个新请求，上游会重新生成并重新计费。
+
 ## 压缩
 
 - 支持 `gzip`、`deflate`、`br`、`zstd` 四种 Content-Encoding
@@ -142,3 +173,4 @@ dump 成功打印 `info` 日志（含路径），失败打印 `warn` 但不中�
 - SSE 包装通路下网关等待一个心跳间隔与上游响应赛跑：窗口内上游返回 2xx SSE 流式响应则透传上游状态码与响应头（含 `x-request-id`、限流头等）并桥接 body；窗口超时则网关先行发出 200，此后上游的响应头无法透传给客户端。两种情况下首个心跳都在窗口截止时到期（hyper 在响应体出现第一个字节前不会写出响应头）：窗口超时的路径即刻写出；透传路径只在上游数据截止时还没到才写，否则响应体与上游逐字节相同。之后空闲时每个间隔一个心跳，客户端收到第一个字节的时间不超过一个间隔
 - 无 `Content-Length` 且缓冲超过 `--max-probe-body` 的候选请求返回 413
 - `Content-Length` 超过 `--max-probe-body` 的候选请求直接走透明代理（不探测 `stream` 字段）
+- 打开 `--hold-window` 后，Anthropic Messages 的流式回复不再逐字到达：客户端在回复收全（或攒满窗口）前只收到心跳，之后一次收到；每次重试都让上游重新生成一次回复；提交之后再断仍对客户端可见；请求体在请求结束前一直留在内存里
