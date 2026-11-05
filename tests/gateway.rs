@@ -1526,3 +1526,557 @@ async fn test_passthrough_byte_identical_before_window_end() {
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
 }
+
+// === 先攒后发 + 重试 ===
+
+/// 一次 mock 回复：`cut` 为真时发完 `chunks` 直接关连接，不发结尾的 0 块（模拟上游流到一半断）。
+struct Reply {
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    header_delay_ms: u64,
+    chunks: Vec<(Vec<u8>, u64)>,
+    cut: bool,
+}
+
+/// `start_mock_seq` 的记录：每次请求的请求体，以及网关是否在回复发完前关掉了连接。
+#[derive(Default)]
+struct SeqLog {
+    bodies: Vec<Vec<u8>>,
+    closed_early: Vec<bool>,
+}
+
+type SharedLog = std::sync::Arc<parking_lot::Mutex<SeqLog>>;
+
+/// 按请求序号（从 0 起）决定回复的 mock 上游（原始 TCP）。
+async fn start_mock_seq<F>(reply: F) -> (SocketAddr, SharedLog, oneshot::Sender<()>)
+where
+    F: Fn(usize) -> Reply + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = oneshot::channel::<()>();
+    let reply = std::sync::Arc::new(reply);
+    let log = SharedLog::default();
+    let log_srv = log.clone();
+    tokio::task::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept = listener.accept() => {
+                    let (mut stream, _) = match accept { Ok(v) => v, Err(_) => continue };
+                    let reply = reply.clone();
+                    let log = log_srv.clone();
+                    tokio::task::spawn(async move {
+                        let mut buf = vec![0u8; 8192];
+                        let mut req_data = Vec::new();
+                        loop {
+                            let n = stream.read(&mut buf).await.unwrap();
+                            if n == 0 { return; }
+                            req_data.extend_from_slice(&buf[..n]);
+                            if req_data.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                        }
+                        let header_end = req_data.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let req_str = String::from_utf8_lossy(&req_data[..header_end]).into_owned();
+                        let cl = req_str.lines()
+                            .find(|l| l.to_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let mut body = req_data[header_end..].to_vec();
+                        while body.len() < cl {
+                            let n = stream.read(&mut buf).await.unwrap();
+                            if n == 0 { break; }
+                            body.extend_from_slice(&buf[..n]);
+                        }
+                        let idx = {
+                            let mut l = log.lock();
+                            l.bodies.push(body);
+                            l.closed_early.push(false);
+                            l.bodies.len() - 1
+                        };
+                        let r = reply(idx);
+                        let (mut rd, mut wr) = stream.into_split();
+                        let write = async move {
+                            if r.header_delay_ms > 0 {
+                                sleep(Duration::from_millis(r.header_delay_ms)).await;
+                            }
+                            let mut head = format!("HTTP/1.1 {}\r\n", r.status);
+                            for (k, v) in &r.headers {
+                                head.push_str(&format!("{}: {}\r\n", k, v));
+                            }
+                            head.push_str("transfer-encoding: chunked\r\n\r\n");
+                            wr.write_all(head.as_bytes()).await?;
+                            for (chunk, delay_ms) in &r.chunks {
+                                if *delay_ms > 0 {
+                                    sleep(Duration::from_millis(*delay_ms)).await;
+                                }
+                                wr.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await?;
+                                wr.write_all(chunk).await?;
+                                wr.write_all(b"\r\n").await?;
+                                wr.flush().await?;
+                            }
+                            if !r.cut {
+                                wr.write_all(b"0\r\n\r\n").await?;
+                                wr.flush().await?;
+                            }
+                            Ok::<_, std::io::Error>(())
+                        };
+                        // 网关关掉连接时读到 EOF。
+                        let watch = async move {
+                            let mut b = [0u8; 64];
+                            loop {
+                                match rd.read(&mut b).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                        };
+                        tokio::select! {
+                            _ = write => {}
+                            _ = watch => log.lock().closed_early[idx] = true,
+                        }
+                    });
+                }
+            }
+        }
+    });
+    (addr, log, tx)
+}
+
+/// 一段完整的 Anthropic 流式回复（逐事件），文本为 `text`。
+fn anthropic_reply(text: &str) -> Vec<Vec<u8>> {
+    vec![
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n".to_vec(),
+        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_vec(),
+        format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n").into_bytes(),
+        b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_vec(),
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n".to_vec(),
+        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec(),
+    ]
+}
+
+/// Anthropic 流式 error 事件。
+fn anthropic_error_event(etype: &str) -> Vec<u8> {
+    format!("event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{etype}\",\"message\":\"boom\"}}}}\n\n").into_bytes()
+}
+
+/// 2xx SSE 回复，事件之间隔 `delay_ms`。
+fn sse_reply(events: Vec<Vec<u8>>, delay_ms: u64, cut: bool) -> Reply {
+    Reply {
+        status: 200,
+        headers: vec![("content-type", "text/event-stream".to_string())],
+        header_delay_ms: 0,
+        chunks: events.into_iter().map(|e| (e, delay_ms)).collect(),
+        cut,
+    }
+}
+
+/// 非 2xx JSON 回复。
+fn status_reply(status: u16, body: &str) -> Reply {
+    Reply {
+        status,
+        headers: vec![("content-type", "application/json".to_string())],
+        header_delay_ms: 0,
+        chunks: vec![(body.as_bytes().to_vec(), 0)],
+        cut: false,
+    }
+}
+
+const HOLD_REQ_BODY: &str =
+    r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+const SUB2API_502_BODY: &str =
+    r#"{"type":"error","error":{"type":"upstream_error","message":"Upstream request failed"}}"#;
+
+/// 先攒后发测试用配置：W = 60 s，迟到错误改写为 overloaded_error。
+fn hold_cfg(upstream: SocketAddr, heartbeat: u64) -> ResolvedConfig {
+    ResolvedConfig {
+        anthropic_late_error_type: Some("overloaded_error".to_string()),
+        hold_window: Duration::from_secs(60),
+        ..test_cfg(upstream, heartbeat, 32 * 1024 * 1024)
+    }
+}
+
+/// 发 `HOLD_REQ_BODY`，返回 (status, headers, 去分块后的 body)。
+async fn post_hold(gw: SocketAddr) -> (u16, Vec<(String, String)>, String) {
+    let req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        HOLD_REQ_BODY.len(),
+        HOLD_REQ_BODY
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, body) = parse_response(&resp);
+    let is_chunked = headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.contains("chunked"));
+    let body = if is_chunked { dechunk(&body) } else { body };
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
+fn concat(events: &[Vec<u8>]) -> String {
+    String::from_utf8(events.concat()).unwrap()
+}
+
+#[tokio::test]
+async fn test_hold_retry_after_mid_stream_cut() {
+    // 第一次发出一半事件后断开，第二次完整 → 客户端只收到第二次的完整事件流
+    let (upstream, log, tx) = start_mock_seq(|i| {
+        if i == 0 {
+            let mut ev = anthropic_reply("first");
+            ev.truncate(3);
+            sse_reply(ev, 50, true)
+        } else {
+            sse_reply(anthropic_reply("second"), 50, false)
+        }
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, concat(&anthropic_reply("second")));
+    let log = log.lock();
+    assert_eq!(log.bodies.len(), 2);
+    assert!(log.bodies.iter().all(|b| b == HOLD_REQ_BODY.as_bytes()));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_retry_after_502() {
+    // 第一次 502，第二次成功 → 客户端收到成功的流
+    let (upstream, log, tx) = start_mock_seq(|i| {
+        if i == 0 {
+            status_reply(502, SUB2API_502_BODY)
+        } else {
+            sse_reply(anthropic_reply("ok"), 0, false)
+        }
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, concat(&anthropic_reply("ok")));
+    assert_eq!(log.lock().bodies.len(), 2);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_400_passthrough_no_retry() {
+    // 400 → 立即透传状态码与错误体，上游只收到 1 次
+    let err = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#;
+    let (upstream, log, tx) = start_mock_seq(move |_| status_reply(400, err)).await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+    let (status, headers, body) = post_hold(gw).await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str()),
+        Some("application/json")
+    );
+    assert_eq!(body, err);
+    assert_eq!(log.lock().bodies.len(), 1);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_retry_after_api_error_event() {
+    // 第一次中途收到 api_error 事件后正常结束，第二次完整 → 客户端收到完整流
+    let (upstream, log, tx) = start_mock_seq(|i| {
+        if i == 0 {
+            let mut ev = anthropic_reply("first");
+            ev.truncate(2);
+            ev.push(anthropic_error_event("api_error"));
+            sse_reply(ev, 0, false)
+        } else {
+            sse_reply(anthropic_reply("second"), 0, false)
+        }
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, concat(&anthropic_reply("second")));
+    assert_eq!(log.lock().bodies.len(), 2);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_final_error_event_not_retried() {
+    // 中途收到 invalid_request_error / rate_limit_error 事件 → 不重试，客户端收到这个 error 事件
+    for etype in ["invalid_request_error", "rate_limit_error"] {
+        let mut events = anthropic_reply("x");
+        events.truncate(1);
+        events.push(anthropic_error_event(etype));
+        let sent = events.clone();
+        let (upstream, log, tx) =
+            start_mock_seq(move |_| sse_reply(events.clone(), 0, false)).await;
+        let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+        let (status, _, body) = post_hold(gw).await;
+        assert_eq!(status, 200, "{etype}");
+        assert_eq!(body, concat(&sent), "{etype}");
+        assert_eq!(log.lock().bodies.len(), 1, "{etype}");
+
+        tx.send(()).unwrap();
+        gw_tx.send(()).unwrap();
+    }
+}
+
+/// 每次都在 0.2 s 后回响应头、3 个事件后断开的上游。
+fn always_cut(_: usize) -> Reply {
+    let mut ev = anthropic_reply("partial");
+    ev.truncate(3);
+    let mut r = sse_reply(ev, 0, true);
+    r.header_delay_ms = 200;
+    r
+}
+
+#[tokio::test]
+async fn test_hold_stream_retries_exhausted_in_window() {
+    // 流断次数超过上限、全在窗口内 → 502 + api_error JSON，客户端收不到半截内容
+    let (upstream, log, tx) = start_mock_seq(always_cut).await;
+    let cfg = ResolvedConfig {
+        max_stream_retries: 2,
+        ..hold_cfg(upstream, 60)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 502);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "api_error");
+    assert!(!body.contains("partial"), "{body}");
+    assert_eq!(log.lock().bodies.len(), 3);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_stream_retries_exhausted_late() {
+    // 流断次数超过上限、拖过 1 s 窗口 → 200、心跳和改写后的 overloaded_error 事件，没有半截内容
+    let (upstream, log, tx) = start_mock_seq(always_cut).await;
+    let cfg = ResolvedConfig {
+        max_stream_retries: 1,
+        ..hold_cfg(upstream, 1)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200);
+    assert!(body.starts_with(":\n\n"), "{body}");
+    assert!(body.contains("\"type\":\"overloaded_error\""), "{body}");
+    assert!(!body.contains("partial"), "{body}");
+    assert!(!body.contains("message_start"), "{body}");
+    assert_eq!(log.lock().bodies.len(), 2);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_status_retry_deadline() {
+    // 一直 502、重试时限 2 s：0 s、1 s 各一次，下一次要到 3 s，超出时限 → 不再发起
+    for heartbeat in [60, 1] {
+        let (upstream, log, tx) = start_mock_seq(|_| status_reply(502, SUB2API_502_BODY)).await;
+        let cfg = ResolvedConfig {
+            retry_deadline: Duration::from_secs(2),
+            ..hold_cfg(upstream, heartbeat)
+        };
+        let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+        let (status, _, body) = post_hold(gw).await;
+        if heartbeat == 60 {
+            // 窗口内：透传状态码与错误体
+            assert_eq!(status, 502);
+            assert_eq!(body, SUB2API_502_BODY);
+        } else {
+            // 窗口后：200 + 迟到改写的 error 事件
+            assert_eq!(status, 200);
+            assert!(body.contains("\"type\":\"overloaded_error\""), "{body}");
+            assert!(body.contains("Upstream request failed"), "{body}");
+        }
+        assert_eq!(log.lock().bodies.len(), 2, "heartbeat {heartbeat}");
+
+        tx.send(()).unwrap();
+        gw_tx.send(()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_hold_stream_retry_after_deadline() {
+    // 首字节晚：请求到达 1.5 s 后才第一次流断，已过 1 s 重试时限，仍然重试
+    let (upstream, log, tx) = start_mock_seq(|i| {
+        if i == 0 {
+            let mut ev = anthropic_reply("first");
+            ev.truncate(2);
+            let mut r = sse_reply(ev, 0, true);
+            r.header_delay_ms = 1500;
+            r
+        } else {
+            sse_reply(anthropic_reply("second"), 0, false)
+        }
+    })
+    .await;
+    let cfg = ResolvedConfig {
+        retry_deadline: Duration::from_secs(1),
+        ..hold_cfg(upstream, 60)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, concat(&anthropic_reply("second")));
+    assert_eq!(log.lock().bodies.len(), 2);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_body_over_limit_not_held() {
+    // 请求体超过 hold_max_body → 不攒、不重试：半截内容照常转发，随后是 api_error 事件
+    let (upstream, log, tx) = start_mock_seq(always_cut).await;
+    let cfg = ResolvedConfig {
+        hold_max_body: 8,
+        ..hold_cfg(upstream, 60)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200);
+    assert!(body.starts_with("event: message_start"), "{body}");
+    assert!(body.contains("partial"), "{body}");
+    assert!(body.contains("\"type\":\"api_error\""), "{body}");
+    assert_eq!(log.lock().bodies.len(), 1);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_window_commits_then_live() {
+    // W = 1 s：攒满 1 s 先发出已攒的部分，之后直播；随后断开 → api_error 事件，不重试
+    let (upstream, log, tx) = start_mock_seq(|_| {
+        let mut ev = anthropic_reply("long");
+        ev.truncate(5);
+        sse_reply(ev, 400, true)
+    })
+    .await;
+    let cfg = ResolvedConfig {
+        hold_window: Duration::from_secs(1),
+        ..hold_cfg(upstream, 60)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let started = std::time::Instant::now();
+    let mut stream = open_hold_stream(gw).await;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.windows(13).any(|w| w == b"message_start") {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "连接在第一个事件之前关闭: {got:?}");
+        got.extend_from_slice(&buf[..n]);
+    }
+    let first_event = started.elapsed();
+    // 第一个事件在 0.4 s 到上游，攒满 W（第一个字节后 1 s）才发出；整段要到 2 s 才发完。
+    assert!(
+        first_event >= Duration::from_millis(1300) && first_event < Duration::from_millis(1900),
+        "{first_event:?}"
+    );
+    stream.read_to_end(&mut got).await.unwrap();
+    let (status, _, body) = parse_response(&got);
+    assert_eq!(status, 200);
+    let body = String::from_utf8(dechunk(&body)).unwrap();
+    let mut events = anthropic_reply("long");
+    events.truncate(5);
+    assert!(body.starts_with(&concat(&events)), "{body}");
+    assert!(body.contains("\"type\":\"api_error\""), "{body}");
+    assert_eq!(log.lock().bodies.len(), 1);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+/// 发 `HOLD_REQ_BODY`（Connection: close），返回连接。
+async fn open_hold_stream(gw: SocketAddr) -> tokio::net::TcpStream {
+    let req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        HOLD_REQ_BODY.len(),
+        HOLD_REQ_BODY
+    );
+    let mut stream = tokio::net::TcpStream::connect(gw).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream
+}
+
+#[tokio::test]
+async fn test_hold_client_disconnect_cancels() {
+    // 攒着时客户端断开 → 上游连接被关掉，之后没有新的请求（日志见 tests/hold_log.rs）
+    let (upstream, log, tx) = start_mock_seq(|_| {
+        let ev = anthropic_reply("slow");
+        let mut r = sse_reply(vec![ev[0].clone(), ev[1].clone()], 0, false);
+        r.chunks[1].1 = 5000; // 第二个事件 5 s 后才到
+        r
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+    let stream = open_hold_stream(gw).await;
+    sleep(Duration::from_millis(500)).await;
+    drop(stream);
+
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        while !log.lock().closed_early.first().copied().unwrap_or(false) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "客户端断开后上游连接应被关闭");
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(log.lock().bodies.len(), 1);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_beyond_heartbeat_window() {
+    // 攒着超过 1 s 心跳窗口 → 客户端先收到 200 和心跳，收全后收到完整事件流
+    let (upstream, log, tx) =
+        start_mock_seq(|_| sse_reply(anthropic_reply("late"), 500, false)).await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 1)).await;
+
+    let mut stream = open_hold_stream(gw).await;
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_millis(1500)).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(!head.contains("message_start"), "{head}");
+
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    let mut raw = head.into_bytes();
+    raw.extend_from_slice(&rest);
+    let (status, _, body) = parse_response(&raw);
+    assert_eq!(status, 200);
+    let body = String::from_utf8(dechunk(&body)).unwrap();
+    let events = body.trim_start_matches(":\n\n");
+    assert_eq!(events, concat(&anthropic_reply("late")));
+    assert!(body.len() - events.len() >= 6, "至少两个心跳: {body:?}");
+    assert_eq!(log.lock().bodies.len(), 1);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
