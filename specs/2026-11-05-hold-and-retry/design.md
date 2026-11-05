@@ -49,7 +49,7 @@ stateDiagram-v2
 - `Commit`：不再攒（攒满 W、缓存超过 `hold_max_bytes`、不可重试的 error 事件），带响应头、已攒的字节和剩下的解码流；
 - `Deliver`：照现在的方式交出的响应（不可重试的状态码；2xx 但不是 SSE 或编码不可解）；
 - `Status`：可重试的状态码（500、502、503、504、529）；
-- `Connect`：连接上游失败；
+- `Request`：上游请求失败（连不上，或回响应头之前连接就断了）；
 - `Stream`：流到一半断（读出错、没有 `message_stop` 就结束、可重试的 error 事件）。
 
 W 从本次第一个字节起算，用一个只在收到第一个字节后才启用的计时器与读流赛跑。
@@ -78,7 +78,7 @@ W 从本次第一个字节起算，用一个只在收到第一个字节后才启
 ### 重试
 
 - 退避按已重试次数取 1、2、4、8 s，之后每次 8 s；状态码失败与流断共用这个序列。
-- 状态码、连接失败：`now + 退避 <= arrived + retry_deadline` 才重试，否则交出这次的结果。
+- 状态码、请求失败：`now + 退避 <= arrived + retry_deadline` 才重试，否则交出这次的结果。时长大到加不上去时视为没有时限；`hold_window` 同理，视为不按时间提交。
 - 流断：`stream_retries < max_stream_retries` 才重试，不看时限。
 - 要重试时丢弃这次的响应（hyper client 关闭该连接）和已攒的字节。
 
@@ -86,9 +86,9 @@ W 从本次第一个字节起算，用一个只在收到第一个字节后才启
 
 - 每次重试一行 warn：`attempt`、`reason`、`backoff_ms`、`stream_retries`。
 - 每个走这条路径的请求结束时一行 info：`outcome`（`complete` / `committed` / `error` / `cancelled`）、`attempts`、`stream_retries`、`hold_ms`（最后一次从第一个字节到写给客户端）、`total_ms`（从请求到达起）、`body_read_ms`、`failures`（每次失败的原因）。
-- 原因只写状态码、错误类型和传输错误的描述，不写请求体、响应体和头。
+- 原因只写状态码、错误类型和传输错误的描述（连同 source 链：hyper 的错误自身只说类别），不写请求体、响应体和头。
 
-`outcome`：`complete` 是收全后一次发出；`committed` 是转为直播（含 2xx 但不攒的响应）；`error` 是最后交给客户端的是错误（不可重试的状态码或 error 事件、重试用完）；`cancelled` 是客户端在结论之前断开。
+`outcome`：`complete` 是收全后一次发出（发出途中客户端断开记为 `cancelled`）；`committed` 是转为直播（含 2xx 但不攒的响应）；`error` 是最后交给客户端的是错误（不可重试的状态码或 error 事件、重试用完）；`cancelled` 是客户端在结论之前断开。
 
 ## 对现有代码的改动（`src/sse.rs`、`src/encoding.rs`）
 

@@ -94,7 +94,7 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 
 何时重试：
 
-- 状态码 500、502、503、504、529，或连接上游失败：只在请求到达后 `--retry-deadline` 秒内发起新的一次。
+- 状态码 500、502、503、504、529，或上游请求失败（连不上，或连上后未回响应头就断开）：只在请求到达后 `--retry-deadline` 秒内发起新的一次。
 - 流到一半断，即上游流读出错、没有 `message_stop` 就结束，或收到 `event: error` 且 `error.type` 不是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`request_too_large`、`billing_error`、`rate_limit_error`：不受时限限制，每个请求最多 `--max-stream-retries` 次。
 - 退避按已重试次数取 1、2、4、8 s，之后每次 8 s。
 - 其他状态码（400、401、403、404、413、429 等）立即照原样交出；上面名单里的 error 事件随已攒的事件一起交给客户端。
@@ -103,12 +103,12 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 
 重试用完时：
 
-- 最后一次是状态码或连接失败：窗口内透传状态码与错误体（连接失败为 502），窗口后发错误事件（按 `--anthropic-late-error-type` 的规则改写）。
+- 最后一次是状态码或请求失败：窗口内透传状态码与错误体（请求失败为 502），窗口后发错误事件（按 `--anthropic-late-error-type` 的规则改写）。
 - 最后一次是流到一半断：丢掉半截回复，窗口内回 502 与 Anthropic 错误 JSON（`api_error`，`upstream stream interrupted: ...`），窗口后发错误事件（按请求失败处理，同样适用迟到改写）。
 
 攒着、退避和重试期间心跳窗口照常：窗口内有结论就透传上游状态码与响应头，窗口到期先回 200 和心跳，之后每个间隔一个。客户端在这期间断开时，网关立即放弃当前上游请求，不再重试。
 
-每个走这条通路的请求结束时写一行 `info` 日志 `hold finished`，字段：`outcome`（`complete` 收全后一次发出 / `committed` 转为直播 / `error` 交给客户端的是错误 / `cancelled` 客户端先断开）、`detail`、`attempts`、`stream_retries`、`hold_ms`（最后一次从第一个字节到写给客户端）、`total_ms`、`body_read_ms`、`failures`（每次失败的原因）；每次重试另写一行 `warn`。日志不含请求体、响应体和头。
+每个走这条通路的请求结束时写一行 `info` 日志 `hold finished`，字段：`outcome`（`complete` 收全后一次发出 / `committed` 转为直播 / `error` 交给客户端的是错误 / `cancelled` 客户端先断开）、`detail`、`attempts`、`stream_retries`、`hold_ms`（最后一次从第一个字节到写给客户端）、`total_ms`、`body_read_ms`、`failures`（每次失败的原因，传输错误带上其 source 链）；每次重试另写一行 `warn`。日志不含请求体、响应体和头。
 
 计费提示：每次重试对上游都是一个新请求，上游会重新生成并重新计费。
 

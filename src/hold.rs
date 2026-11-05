@@ -43,6 +43,18 @@ const MAX_FIELD: usize = 64 * 1024;
 
 type UpstreamError = hyper_util::client::legacy::Error;
 
+/// 错误连同它的 source 链：hyper 的错误自身只说类别（如 `client error (Connect)`），原因在 source 里。
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        source = s.source();
+    }
+    out
+}
+
 /// 已重试 `n` 次之后的退避：1、2、4、8 s，之后每次 8 s。
 fn backoff(n: u32) -> Duration {
     Duration::from_secs(1 << n.min(3))
@@ -142,8 +154,8 @@ enum Attempt {
     Deliver(Response<Incoming>),
     /// 可重试的状态码。
     Status(Response<Incoming>),
-    /// 连接上游失败。
-    Connect(UpstreamError),
+    /// 上游请求失败：连不上，或回响应头之前连接就断了。
+    Request(UpstreamError),
     /// 流到一半断：读出错、没有 `message_stop` 就结束、可重试的 error 事件。
     Stream(String),
 }
@@ -157,7 +169,7 @@ async fn attempt(
 ) -> Attempt {
     let resp = match client.request(req).await {
         Ok(r) => r,
-        Err(e) => return Attempt::Connect(e),
+        Err(e) => return Attempt::Request(e),
     };
     let status = resp.status();
     if !status.is_success() {
@@ -217,7 +229,9 @@ async fn attempt(
                     return Attempt::Commit(held, stream, Commit::MaxBytes);
                 }
             }
-            Some(Err(e)) => return Attempt::Stream(format!("stream read error: {e}")),
+            Some(Err(e)) => {
+                return Attempt::Stream(format!("stream read error: {}", error_chain(&e)));
+            }
             None if scanner.saw_stop => {
                 return Attempt::Complete(Held::new(head, chunks, first_byte));
             }
@@ -282,13 +296,13 @@ async fn drive(
             Attempt::Complete(held) => break Finish::Complete(held),
             Attempt::Commit(held, stream, why) => break Finish::Commit(held, stream, why),
             Attempt::Deliver(resp) => break Finish::Deliver(Ok(resp)),
-            // 状态码与连接失败：新的一次只能在重试时限内发起。
+            // 状态码与请求失败：新的一次只能在重试时限内发起。
             Attempt::Status(resp) => (
                 format!("status {}", resp.status().as_u16()),
                 past_deadline.then(|| Finish::Deliver(Ok(resp))),
             ),
-            Attempt::Connect(e) => (
-                format!("connect error: {e}"),
+            Attempt::Request(e) => (
+                format!("request error: {}", error_chain(&e)),
                 past_deadline.then(|| Finish::Deliver(Err(e))),
             ),
             // 流断：不受时限限制，只受次数限制。
@@ -330,15 +344,22 @@ async fn drive(
         Finish::Cancelled => ("cancelled", "client gone"),
         Finish::Complete(held) => {
             report.hold = Some(held.first_byte.elapsed());
+            let mut delivered = false;
             if let Some((mut writer, _)) = down.into_writer(held.head) {
+                delivered = true;
                 for chunk in held.chunks {
                     if writer.write_event(chunk).await.is_err() {
+                        delivered = false;
                         break;
                     }
                 }
                 writer.end().await;
             }
-            ("complete", "message_stop")
+            if delivered {
+                ("complete", "message_stop")
+            } else {
+                ("cancelled", "client gone while writing")
+            }
         }
         Finish::Commit(held, stream, why) => {
             report.hold = Some(held.first_byte.elapsed());
@@ -376,12 +397,13 @@ async fn drive(
         }
         Finish::Deliver(resp) => {
             let result = match &resp {
-                Ok(r) if r.status().is_success() => ("committed", "not an event stream"),
+                // 2xx 但不是 SSE，或编码解不开。
+                Ok(r) if r.status().is_success() => ("committed", "not held"),
                 Ok(r) if RETRY_STATUS.contains(&r.status().as_u16()) => {
                     ("error", "status retries exhausted")
                 }
                 Ok(_) => ("error", "final status"),
-                Err(_) => ("error", "connect retries exhausted"),
+                Err(_) => ("error", "request retries exhausted"),
             };
             down.deliver(kind, late_type, resp).await;
             result
