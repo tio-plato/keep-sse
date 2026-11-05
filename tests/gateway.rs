@@ -1529,7 +1529,8 @@ async fn test_passthrough_byte_identical_before_window_end() {
 
 // === 先攒后发 + 重试 ===
 
-/// 一次 mock 回复：`cut` 为真时发完 `chunks` 直接关连接，不发结尾的 0 块（模拟上游流到一半断）。
+/// 一次 mock 回复：`cut` 为真时发完 `chunks` 直接关连接，不发结尾的 0 块（模拟上游流到一半断）；
+/// `status` 为 0 时读完请求就关连接，什么都不回（模拟请求失败）。
 struct Reply {
     status: u16,
     headers: Vec<(&'static str, String)>,
@@ -1595,6 +1596,9 @@ where
                             l.bodies.len() - 1
                         };
                         let r = reply(idx);
+                        if r.status == 0 {
+                            return;
+                        }
                         let (mut rd, mut wr) = stream.into_split();
                         let write = async move {
                             if r.header_delay_ms > 0 {
@@ -1743,11 +1747,35 @@ async fn test_hold_retry_after_mid_stream_cut() {
 }
 
 #[tokio::test]
-async fn test_hold_retry_after_502() {
-    // 第一次 502，第二次成功 → 客户端收到成功的流
+async fn test_hold_retry_after_5xx() {
+    // 第一次 500/502/503/504/529，第二次成功 → 客户端收到成功的流
+    for code in [500, 502, 503, 504, 529] {
+        let (upstream, log, tx) = start_mock_seq(move |i| {
+            if i == 0 {
+                status_reply(code, SUB2API_502_BODY)
+            } else {
+                sse_reply(anthropic_reply("ok"), 0, false)
+            }
+        })
+        .await;
+        let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+        let (status, _, body) = post_hold(gw).await;
+        assert_eq!(status, 200, "{code}");
+        assert_eq!(body, concat(&anthropic_reply("ok")), "{code}");
+        assert_eq!(log.lock().bodies.len(), 2, "{code}");
+
+        tx.send(()).unwrap();
+        gw_tx.send(()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_hold_retry_after_request_failure() {
+    // 第一次读完请求就断开、不回响应头，第二次成功 → 客户端收到成功的流
     let (upstream, log, tx) = start_mock_seq(|i| {
         if i == 0 {
-            status_reply(502, SUB2API_502_BODY)
+            status_reply(0, "")
         } else {
             sse_reply(anthropic_reply("ok"), 0, false)
         }
@@ -1765,26 +1793,50 @@ async fn test_hold_retry_after_502() {
 }
 
 #[tokio::test]
-async fn test_hold_400_passthrough_no_retry() {
-    // 400 → 立即透传状态码与错误体，上游只收到 1 次
-    let err = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#;
-    let (upstream, log, tx) = start_mock_seq(move |_| status_reply(400, err)).await;
+async fn test_hold_retry_after_clean_end_without_stop() {
+    // 第一次发出一半事件后正常结束（有结尾块，但没有 message_stop），第二次完整 → 重试
+    let (upstream, log, tx) = start_mock_seq(|i| {
+        let mut ev = anthropic_reply(if i == 0 { "first" } else { "second" });
+        if i == 0 {
+            ev.truncate(3);
+        }
+        sse_reply(ev, 0, false)
+    })
+    .await;
     let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
 
-    let (status, headers, body) = post_hold(gw).await;
-    assert_eq!(status, 400);
-    assert_eq!(
-        headers
-            .iter()
-            .find(|(k, _)| k == "content-type")
-            .map(|(_, v)| v.as_str()),
-        Some("application/json")
-    );
-    assert_eq!(body, err);
-    assert_eq!(log.lock().bodies.len(), 1);
+    let (status, _, body) = post_hold(gw).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, concat(&anthropic_reply("second")));
+    assert_eq!(log.lock().bodies.len(), 2);
 
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_4xx_passthrough_no_retry() {
+    // 400/401/403/404/413/429 → 立即透传状态码与错误体，上游只收到 1 次
+    let err = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#;
+    for code in [400, 401, 403, 404, 413, 429] {
+        let (upstream, log, tx) = start_mock_seq(move |_| status_reply(code, err)).await;
+        let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+        let (status, headers, body) = post_hold(gw).await;
+        assert_eq!(status, code);
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(k, _)| k == "content-type")
+                .map(|(_, v)| v.as_str()),
+            Some("application/json")
+        );
+        assert_eq!(body, err, "{code}");
+        assert_eq!(log.lock().bodies.len(), 1, "{code}");
+
+        tx.send(()).unwrap();
+        gw_tx.send(()).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1814,8 +1866,16 @@ async fn test_hold_retry_after_api_error_event() {
 
 #[tokio::test]
 async fn test_hold_final_error_event_not_retried() {
-    // 中途收到 invalid_request_error / rate_limit_error 事件 → 不重试，客户端收到这个 error 事件
-    for etype in ["invalid_request_error", "rate_limit_error"] {
+    // 中途收到不可重试类型的 error 事件 → 不重试，客户端收到这个 error 事件
+    for etype in [
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "request_too_large",
+        "billing_error",
+        "rate_limit_error",
+    ] {
         let mut events = anthropic_reply("x");
         events.truncate(1);
         events.push(anthropic_error_event(etype));
@@ -2103,6 +2163,106 @@ async fn test_hold_huge_durations_do_not_panic() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, concat(&anthropic_reply("ok")));
     assert_eq!(log.lock().bodies.len(), 2);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_max_bytes_commits_then_live() {
+    // 缓存超过 hold_max_bytes：先发出已攒的部分，之后直播；随后断开 → api_error 事件，不重试
+    let events = {
+        let mut ev = anthropic_reply("big");
+        ev.truncate(5);
+        ev
+    };
+    // 第三个事件（1.2 s 到上游）让缓存超限。
+    let cap = events[0].len() + events[1].len();
+    let sent = events.clone();
+    let (upstream, log, tx) = start_mock_seq(move |_| sse_reply(sent.clone(), 400, true)).await;
+    let cfg = ResolvedConfig {
+        hold_max_bytes: cap,
+        ..hold_cfg(upstream, 60)
+    };
+    let (gw, gw_tx) = start_gateway_with(cfg).await;
+
+    let started = std::time::Instant::now();
+    let mut stream = open_hold_stream(gw).await;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.windows(13).any(|w| w == b"message_start") {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "连接在第一个事件之前关闭: {got:?}");
+        got.extend_from_slice(&buf[..n]);
+    }
+    let first_event = started.elapsed();
+    // 第一个事件 0.4 s 到上游，攒到 1.2 s 超限才发出；整段要到 2 s 才发完。
+    assert!(
+        first_event >= Duration::from_millis(1100) && first_event < Duration::from_millis(1900),
+        "{first_event:?}"
+    );
+    stream.read_to_end(&mut got).await.unwrap();
+    let (status, _, body) = parse_response(&got);
+    assert_eq!(status, 200);
+    let body = String::from_utf8(dechunk(&body)).unwrap();
+    assert!(body.starts_with(&concat(&events)), "{body}");
+    assert!(body.contains("\"type\":\"api_error\""), "{body}");
+    assert_eq!(log.lock().bodies.len(), 1);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_client_disconnect_after_200_cancels() {
+    // 网关已回 200 和心跳、仍在攒：客户端断开 → 上游连接立即被关掉，之后没有新的请求
+    let (upstream, log, tx) = start_mock_seq(|_| {
+        let ev = anthropic_reply("slow");
+        let mut r = sse_reply(vec![ev[0].clone(), ev[1].clone()], 0, false);
+        r.chunks[1].1 = 5000; // 第二个事件 5 s 后才到
+        r
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 1)).await;
+
+    let mut stream = open_hold_stream(gw).await;
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_millis(1500)).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    drop(stream);
+
+    // 不等下一个心跳（1 s 后）写失败才发现。
+    let closed = tokio::time::timeout(Duration::from_millis(500), async {
+        while !log.lock().closed_early.first().copied().unwrap_or(false) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "客户端断开后上游连接应立即被关闭");
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(log.lock().bodies.len(), 1);
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_hold_client_disconnect_during_backoff_cancels() {
+    // 第一次 502 后在 1 s 退避中：客户端断开 → 不再发起第二次
+    let (upstream, log, tx) = start_mock_seq(|i| {
+        if i == 0 {
+            status_reply(502, SUB2API_502_BODY)
+        } else {
+            sse_reply(anthropic_reply("ok"), 0, false)
+        }
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+    let stream = open_hold_stream(gw).await;
+    sleep(Duration::from_millis(300)).await;
+    drop(stream);
+    sleep(Duration::from_millis(2000)).await;
+    assert_eq!(log.lock().bodies.len(), 1);
 
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
