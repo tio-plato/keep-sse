@@ -54,7 +54,7 @@ stateDiagram-v2
 
 W 从本次第一个字节起算，用一个只在收到第一个字节后才启用的计时器与读流赛跑。
 
-`EventScanner` 跟踪解码后的事件流：按 `\r`、`\n`、`\r\n` 切行，记下当前事件的 `event:` 和 `data:`，在空行处判定。只关心两类事件：`message_stop`，以及 `error`（取 data JSON 里的 `error.type`，解析不了视为未知类型、按可重试处理）。单行和单个事件的 data 最多留 64 KiB。
+`EventScanner` 跟踪解码后的事件流：按 `\r`、`\n`、`\r\n` 切行，记下当前事件的 `event:` 和 `data:`，在空行处判定。只关心两类事件：`message_stop`，以及 `error`（取 data JSON 里的 `error.type`，解析不了视为未知类型、按可重试处理）。没有 event 行、data 是 `{"type":"error",…}` 的帧也算 `error`：有的网关在已经回过 ping 之后出错时只写 data 行。单行和单个事件的 data 最多留 64 KiB。
 
 ### 下行：`Downstream`
 

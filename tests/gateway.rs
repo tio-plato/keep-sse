@@ -2298,3 +2298,44 @@ async fn test_hold_status_retry_deadline_restarts_after_stream_break() {
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
 }
+
+/// sub2api 在已开始回 ping 之后写的错误帧：只有 data 行，没有 `event: error`。
+fn sub2api_error_frame(etype: &str) -> Vec<u8> {
+    format!(
+        "data: {{\"type\":\"error\",\"error\":{{\"type\":\"{etype}\",\"message\":\"boom\"}}}}\n\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn test_hold_error_frame_without_event_line() {
+    // ping 之后来一个不带 event 行的 rate_limit_error 帧 → 不重试，客户端收到这个帧；
+    // api_error 帧 → 重试，第二次完整
+    for (etype, retried) in [("rate_limit_error", false), ("api_error", true)] {
+        let ping = b"event: ping\ndata: {\"type\": \"ping\"}\n\n".to_vec();
+        let first = vec![ping, sub2api_error_frame(etype)];
+        let sent = first.clone();
+        let (upstream, log, tx) = start_mock_seq(move |i| {
+            if i == 0 {
+                sse_reply(first.clone(), 0, false)
+            } else {
+                sse_reply(anthropic_reply("second"), 0, false)
+            }
+        })
+        .await;
+        let (gw, gw_tx) = start_gateway_with(hold_cfg(upstream, 60)).await;
+
+        let (status, _, body) = post_hold(gw).await;
+        assert_eq!(status, 200, "{etype}");
+        if retried {
+            assert_eq!(body, concat(&anthropic_reply("second")), "{etype}");
+            assert_eq!(log.lock().bodies.len(), 2, "{etype}");
+        } else {
+            assert_eq!(body, concat(&sent), "{etype}");
+            assert_eq!(log.lock().bodies.len(), 1, "{etype}");
+        }
+
+        tx.send(()).unwrap();
+        gw_tx.send(()).unwrap();
+    }
+}

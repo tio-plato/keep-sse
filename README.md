@@ -95,7 +95,7 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 何时重试：
 
 - 状态码 500、502、503、504、529，或上游请求失败（连不上，或连上后未回响应头就断开）：只在请求到达后 `--retry-deadline` 秒内发起新的一次；流到一半断过的，从最近一次断开时重新算（上游断流后常紧接着一段拒连）。
-- 流到一半断，即上游流读出错、没有 `message_stop` 就结束，或收到 `event: error` 且 `error.type` 不是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`request_too_large`、`billing_error`、`rate_limit_error`：不受时限限制，每个请求最多 `--max-stream-retries` 次。
+- 流到一半断，即上游流读出错、没有 `message_stop` 就结束，或收到错误事件（`event: error`，或没有 event 行、data 里 `type` 为 `error` 的帧）且 `error.type` 不是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`request_too_large`、`billing_error`、`rate_limit_error`：不受时限限制，每个请求最多 `--max-stream-retries` 次。
 - 退避按已重试次数取 1、2、4、8 s，之后每次 8 s。
 - 其他状态码（400、401、403、404、413、429 等）立即照原样交出；上面名单里的 error 事件随已攒的事件一起交给客户端。
 

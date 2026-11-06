@@ -705,12 +705,24 @@ impl EventScanner {
                 };
                 self.error = Some(etype);
             }
+            // 没有 event 行、data 里 `type` 为 `error` 的帧也算错误事件：sub2api 在已经回过 ping
+            // 之后出错时只写 data 行。
+            b"" if self.error.is_none() && !self.data_cut && is_error_frame(&self.data) => {
+                self.error = Some(error_type(&self.data));
+            }
             _ => {}
         }
         self.event.clear();
         self.data.clear();
         self.data_cut = false;
     }
+}
+
+/// data 是否为 `{"type":"error",…}`。只在没有 event 行时调用，先用子串筛掉绝大多数帧再解析。
+fn is_error_frame(data: &[u8]) -> bool {
+    memchr::memmem::find(data, b"error").is_some()
+        && serde_json::from_slice::<serde_json::Value>(data)
+            .is_ok_and(|v| v.get("type").and_then(|t| t.as_str()) == Some("error"))
 }
 
 /// 取 error 事件 data 里的 `error.type`。
@@ -818,6 +830,22 @@ mod tests {
         assert!(s.data.len() <= MAX_FIELD, "{}", s.data.len());
         s.feed(b"\n");
         assert_eq!(s.error, Some(None));
+    }
+
+    #[test]
+    fn error_frame_without_event_line() {
+        // sub2api 在已经回过 ping 之后出错时只写 data 行，没有 `event: error`。
+        let s = scan(&[
+            b"event: ping\ndata: {\"type\": \"ping\"}\n\n",
+            b"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"x\"}}\n\n",
+        ]);
+        assert_eq!(s.error, Some(Some("rate_limit_error".to_string())));
+    }
+
+    #[test]
+    fn data_only_non_error_frame_ignored() {
+        let s = scan(&[b"data: {\"type\":\"content_block_delta\",\"error\":1}\n\n"]);
+        assert!(s.error.is_none());
     }
 
     #[test]

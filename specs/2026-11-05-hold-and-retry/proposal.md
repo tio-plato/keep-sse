@@ -17,7 +17,7 @@
 - **成功**：只认 `event: message_stop` 加上游 body 正常结束，不依赖上游断流时写的 error 事件的具体内容。
 - **可重试**：
   - 状态码 500、502、503、504、529，或上游请求失败；只在请求到达后 `--retry-deadline` 秒内发起新的一次。流到一半断过的，时限从最近一次断开时重新算：上游断流后常紧接着一段拒连，首字节来得晚的请求也要能等过去。
-  - 流到一半断（读出错、没有 `message_stop` 就结束、收到类型不在下列名单里的 `event: error`）；不受 `--retry-deadline` 限制，每个请求最多 `--max-stream-retries` 次。
+  - 流到一半断（读出错、没有 `message_stop` 就结束、收到类型不在下列名单里的错误事件：`event: error`，或没有 event 行、data 里 `type` 为 `error` 的帧，有的网关在已经回过 ping 之后出错时只写 data 行）；不受 `--retry-deadline` 限制，每个请求最多 `--max-stream-retries` 次。
 - **不可重试**：其他状态码（400、401、403、404、413、429 等）照现在的方式立即交出；`error.type` 为 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`request_too_large`、`billing_error`、`rate_limit_error` 的 error 事件随已攒的事件一起交给客户端。
 - **提交**：一次尝试从上游第一个字节起攒满 `--hold-window` 秒，或缓存超过 `--hold-max-bytes`，就把已攒的部分写给客户端，转为现在的直播行为；之后再出错和现在一样，不再重试。
 - **重试用完**：最后一次是状态码或连接失败，照现在的方式交出（窗口内透传状态码，窗口后按迟到规则发 error 事件）。最后一次是流到一半断，丢掉半截回复，换成一个新的错误：窗口内回 502 和 Anthropic 错误 JSON（`api_error`），窗口后发 error 事件（类型按 `--anthropic-late-error-type` 的迟到改写规则）。
